@@ -1,22 +1,20 @@
 # harmony
 
-An audio asset explorer for Call of Duty installs, written in Rust. Point it at a game
-folder and it works out which title it is, finds the sounds inside the packages, plays
-them, measures them and extracts them. Extraction is one of the things it does, not the
-whole of what it is.
+an audio asset explorer for call of duty titles
 
 ![chinchou](images/chinchou.png)
 
-## what it reads today
+## currently supported
 
 | tab | game | id | status | where the sounds live | container |
 | --- | --- | --- | --- | --- | --- |
+| mw4 | modern warfare 4 | `rex` | partial | `cod26\` | kapi `.xpak` / `.xsub` |
 | mwiii | modern warfare iii | `jup` | verified | `cod23\`, `zone\` | kapi `.xpak` / `.xsub` |
 | mwii | modern warfare ii | `iw9` | expected | `zone\`, `sp22\`, `mp22\` | kapi |
-| cw | black ops cold war | `t9` | expected | `zone\` | kapi `.xsub`, oodle blocks, opus inside |
-| mw19 | modern warfare 2019 | `iw8` | detect only | `zone\` | kapi |
+| cw | black ops cold war | `t9` | partial | `zone\` | kapi `.xsub`, oodle blocks, opus inside |
+| mw19 | modern warfare 2019 | `iw8` | partial | `zone\` | kapi |
 | bo6 | black ops 6 | `t10` | detect only | `zone\` | kapi |
-| bo7 | black ops 7 | `t11` | detect only | `zone\` | kapi |
+| bo7 | black ops 7 | `t11` | partial | `zone\` | kapi |
 | bo4 | black ops 4 | `t8` | expected | `zone\snd\<language>\` in casc | battle.net casc, sab banks (`.sabs`, `.sabl`), flac |
 | bo3 | black ops iii | `t7` | verified | `zone\snd\<language>\` | sab banks (`.sabs`, `.sabl`), flac |
 | bo2 | black ops ii | `t6` | verified | `sound\` | sab banks (`.sabs`, `.sabl`) |
@@ -33,14 +31,18 @@ whole of what it is.
 | cod4 | call of duty 4 | `iw3` | verified | `main\`, `zone\` | `.iwd` archives and `.ff` fastfiles |
 
 *verified* means harmony has read that install end to end. *expected* means the container
-format matches and the same reader should apply. *partial* means the audio comes out but
-without names or a table harmony fully understands: the sound paks have no index it can
-read yet, so the streams are found by their own magic. *detect only* means harmony
-recognises the install but does not yet claim to read its audio. The Battle.net copy of
-Modern Warfare 2 Campaign Remastered is the odd one out: there are no container files on
-disk at all, only CASC archives, so harmony reads the storage itself — the local indices,
-the encoding table and the TVFS root — to find the sound paks inside it, then carves the
-same flac streams out of them as it does for ghosts and advanced warfare. 546 sound
+format matches and the same reader should apply. *partial* means the audio comes out but the
+names do not, for one of two reasons. The older titles' sound paks have no index harmony can
+read yet, so their streams are found by their own magic and carry no names at all. The newer
+ones do carry names, hashed, and harmony ships no name lists to turn them back — so their
+sounds play and extract under their keys until you point harmony at a list of your own.
+Modern Warfare 2019, Cold War, Black Ops 7 and Modern Warfare 4 are all the second kind.
+*detect only* means harmony recognises the install but does not yet claim to read its audio.
+The Battle.net copy of Modern Warfare 2 Campaign Remastered is the odd one out: there are
+no container files on disk at all, only CASC archives, so harmony reads the storage itself
+— the local indices, the encoding table and the TVFS root — to find the sound paks inside
+it, then carves the same flac streams out of them as it does for ghosts and advanced
+warfare. 546 sound
 packages, 141,329 sounds. Blocks that are encrypted stay encrypted: harmony ships no keys.
 Call of Duty 4 and Modern Warfare 2 keep audio in two places at once: the streamed sounds
 sit in the `.iwd` archives, and the sounds a level loads with it sit inside the fastfiles
@@ -117,6 +119,12 @@ Formats out: **wav** (decoded PCM), **ogg** (the original Opus packets remuxed, 
 re-encode — Opus titles only) and **raw** (the blob as the container holds it, with the
 header a sab bank leaves off put back).
 
+A sound harmony could not name is still written somewhere you can find it again. The
+filename presets put the package in front of the key — `eng_codhq [a1b2c3d4e5f6]` — so a
+folder of extracted keys sorts by where they came from rather than by a hash nobody reads,
+and Discord says the same thing the same way, `eng_codhq/a1b2c3d4e5f6`, instead of a bare
+number. Load a name list and both go back to being names.
+
 ## how it feels to use
 
 Nothing slow happens on the thread that draws the window. Fingerprinting a folder, reading
@@ -125,6 +133,17 @@ workers, and the window fills in as they land — a fifty megabyte cache arrives
 frames rather than freezing everything for a second. At startup the window goes up first,
 behind a veil that says `setting up harmony..` while the last folder is recognised and its
 catalogue read.
+
+Leaving a tab does not throw the tab away. The last few games looked at keep their rows,
+their tree and the row that was selected on a shelf, so coming back to one is a frame, not
+a reload — and if the search box and the view have not changed since, the filtered list
+comes back too rather than being built again. Older tabs fall off the shelf and come back
+from their cache.
+
+What is open is the file, not its contents. A sab bank is opened, its header read out of
+the first block and its tables out of the last ones, and the audio between them is left on
+disk until a sound is played — which is the difference between Black Ops II’s hundred and
+ninety-nine banks costing nine gigabytes of memory and costing none.
 
 Harmony draws on the gpu where there is one and falls back rather than fails where there is
 not: wgpu first (vulkan or dx12), then opengl.
@@ -195,13 +214,25 @@ harmony --pull "<game folder>" <n> <out>       # extract n sounds in every forma
 harmony --dump "<game folder>" <package> [n]   # entry layout of a package
 harmony --grab "<game folder>" <package> <key> # one blob to a file
 harmony --stream <file>                        # work out a blob's seek table
+harmony --sound <file> [out.wav]               # decode one file and measure what came out
 harmony --room [folder]                        # free space where harmony writes
+
+harmony --zone <fastfile> [out folder]         # every sound inside one fastfile, as wavs
+harmony --inflate <fastfile> <out file>        # the zone behind a fastfile, uncompressed
+harmony --casc <game folder> [extension]       # what a battle.net storage holds
+harmony --opus-keys <game folder> <package>    # what an encrypted package would need
+
+harmony --hash <name> [name...]                # a name under every hash harmony tries
+harmony --names <game key> <depth> <list...>   # match a cached scan against name lists
+harmony --names-probe <game key> <depth> <csv> # how much of a scan one list names
+harmony --sort <game key> <depth>              # how a cached scan files itself
 ```
 
 ## where harmony keeps things
 
 `%APPDATA%\harmony\`: `settings.json` (the folder remembered for each game, output,
-favorites, tags, collections, presets, window size) and `scan-<game>-<depth>.json` (the cached catalogue of a scan).
+favorites, tags, collections, presets, window size) and `scan-<game>-<depth>.json` (the cached catalogue of a scan) and
+`zones-<game>.json` (what each fastfile turned out to hold).
 
 All three writing folders can be moved, from **folders** in the right-hand panel:
 

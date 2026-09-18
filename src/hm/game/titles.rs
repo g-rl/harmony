@@ -15,7 +15,7 @@ pub fn all() -> Vec<Box<dyn Title>> {
         Box::new(Kapi {
             id: TitleId::Rex,
             label: "modern warfare 4",
-            status: Support::Expected,
+            status: Support::Partial,
             marker: "cod26",
             roots: &["cod26"],
             version: 23,
@@ -34,7 +34,7 @@ pub fn all() -> Vec<Box<dyn Title>> {
         Box::new(Kapi {
             id: TitleId::T9,
             label: "black ops cold war",
-            status: Support::Expected,
+            status: Support::Partial,
             marker: "BlackOpsColdWar.exe",
             roots: &["zone"],
             version: 16,
@@ -42,7 +42,7 @@ pub fn all() -> Vec<Box<dyn Title>> {
         Box::new(Kapi {
             id: TitleId::Iw8,
             label: "modern warfare 2019",
-            status: Support::DetectOnly,
+            status: Support::Partial,
             marker: "zone",
             roots: &["zone"],
             version: 10,
@@ -58,7 +58,7 @@ pub fn all() -> Vec<Box<dyn Title>> {
         Box::new(Kapi {
             id: TitleId::T11,
             label: "black ops 7",
-            status: Support::DetectOnly,
+            status: Support::Partial,
             marker: "bo7",
             roots: &["zone"],
             version: 26,
