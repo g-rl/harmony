@@ -12,6 +12,7 @@ use crate::hm::zone::ZoneSet;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TitleId {
+    Rex,
     Jup,
     Iw9,
     Iw8,
@@ -37,6 +38,7 @@ impl TitleId {
     /// its caches and settings on.
     pub fn key(self) -> &'static str {
         match self {
+            TitleId::Rex => "rex",
             TitleId::Jup => "jup",
             TitleId::Iw9 => "iw9",
             TitleId::Iw8 => "iw8",
@@ -61,6 +63,7 @@ impl TitleId {
     /// What players call the game, short enough for a tab.
     pub fn abbr(self) -> &'static str {
         match self {
+            TitleId::Rex => "mw4",
             TitleId::Jup => "mwiii",
             TitleId::Iw9 => "mwii",
             TitleId::Iw8 => "mw19",

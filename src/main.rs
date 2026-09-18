@@ -157,6 +157,14 @@ fn main() -> eframe::Result<()> {
         stream(std::path::Path::new(path));
         return Ok(());
     }
+    if let Some(at) = args.iter().position(|a| a == "--inflate") {
+        let (Some(path), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {
+            println!("--inflate <fastfile> <output file>");
+            return Ok(());
+        };
+        inflate(std::path::Path::new(path), std::path::Path::new(out));
+        return Ok(());
+    }
     if let Some(at) = args.iter().position(|a| a == "--zone") {
         let Some(path) = args.get(at + 1) else {
             println!("--zone <fastfile> [output folder]");
@@ -235,12 +243,20 @@ fn main() -> eframe::Result<()> {
         dump(std::path::Path::new(root), needle, count);
         return Ok(());
     }
+    if let Some(at) = args.iter().position(|a| a == "--opus-keys") {
+        let (Some(root), Some(needle)) = (args.get(at + 1), args.get(at + 2)) else {
+            println!("--opus-keys <game folder> <package name>");
+            return Ok(());
+        };
+        hits(std::path::Path::new(root), needle, true);
+        return Ok(());
+    }
     if let Some(at) = args.iter().position(|a| a == "--hits") {
         let (Some(root), Some(needle)) = (args.get(at + 1), args.get(at + 2)) else {
             println!("--hits <game folder> <package name>");
             return Ok(());
         };
-        hits(std::path::Path::new(root), needle);
+        hits(std::path::Path::new(root), needle, false);
         return Ok(());
     }
 
@@ -454,7 +470,7 @@ fn packages(root: &std::path::Path) {
 }
 
 /// Headless check: scan one package and report how much of it is audio.
-fn hits(root: &std::path::Path, needle: &str) {
+fn hits(root: &std::path::Path, needle: &str, list: bool) {
     use hm::game::{detect, title_for};
     use hm::pack::kapi::Package;
     use hm::pack::oodle::Oodle;
@@ -507,6 +523,11 @@ fn hits(root: &std::path::Path, needle: &str) {
                 && opus::probe(&blob).is_some()
             {
                 sounds += 1;
+            } else {
+                continue;
+            }
+            if list {
+                println!("{:016x} {} {}", entry.key, entry.size, info.name);
             }
         }
         let seconds = started.elapsed().as_secs_f32();
@@ -864,6 +885,42 @@ fn sound(path: &std::path::Path, out: Option<&std::path::Path>) {
 /// The zone readers are the hardest part of harmony to be sure about from the
 /// window alone: a zone is a linear dump with no table, so the only proof that
 /// a sound was found and not invented is writing it out and listening to it.
+/// Write a modern fastfile's zone out decompressed, which is how its asset
+/// records get looked at in a hex editor.
+fn inflate(path: &std::path::Path, out: &std::path::Path) {
+    use hm::pack::oodle::Oodle;
+    use hm::zone::{assets, xfile};
+
+    let root = path.parent().and_then(|p| p.parent()).unwrap_or(path);
+    let oodle = Oodle::find(root).ok();
+    let zone = match xfile::open(path, oodle.as_ref()) {
+        Ok(zone) => zone,
+        Err(error) => {
+            println!("{error}");
+            return;
+        }
+    };
+    println!(
+        "{} {} bytes, header says {}",
+        zone.header.flavour.label(),
+        zone.data.len(),
+        zone.header.size
+    );
+    if let Some(inventory) = assets::inventory(&zone.data) {
+        println!(
+            "{} assets, table at {:#x}..{:#x}",
+            inventory.assets, inventory.array_at, inventory.array_end
+        );
+        for (kind, count) in &inventory.by_type {
+            println!("  {kind:#x} {count}");
+        }
+    }
+    match std::fs::write(out, &zone.data) {
+        Ok(_) => println!("wrote {}", out.display()),
+        Err(error) => println!("{error}"),
+    }
+}
+
 fn zone_sounds(path: &std::path::Path, out: Option<&std::path::Path>) {
     use hm::sound::decode;
     use hm::zone::iw5;

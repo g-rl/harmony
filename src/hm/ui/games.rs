@@ -9,6 +9,7 @@ use crate::hm::window::chrome;
 
 /// The tab strip, newest first, then the older engines.
 const KNOWN: &[TitleId] = &[
+    TitleId::Rex,
     TitleId::T11,
     TitleId::T10,
     TitleId::Jup,

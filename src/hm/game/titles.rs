@@ -10,6 +10,16 @@ use crate::hm::zone::{ZoneSet, jup as pools};
 
 pub fn all() -> Vec<Box<dyn Title>> {
     let mut titles: Vec<Box<dyn Title>> = vec![
+        // The 2026 title keeps everything under `cod26\`, the way modern
+        // warfare iii keeps it under `cod23\`: no `zone\` at all.
+        Box::new(Kapi {
+            id: TitleId::Rex,
+            label: "modern warfare 4",
+            status: Support::Expected,
+            marker: "cod26",
+            roots: &["cod26"],
+            version: 23,
+        }),
         Box::new(Jup),
         Box::new(Kapi {
             id: TitleId::Iw9,
@@ -193,6 +203,10 @@ impl Title for Kapi {
 
     fn fingerprint(&self, root: &Path) -> Option<Fingerprint> {
         if root.join("cod23").is_dir() {
+            return None;
+        }
+        // Only the title whose roots include it claims a `cod26\` install.
+        if root.join("cod26").is_dir() && !self.roots.contains(&"cod26") {
             return None;
         }
         // Black Ops III writes `.xpak` too, with the same header version as

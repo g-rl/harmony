@@ -20,3 +20,5 @@
 *.bat
 .DS_Store
 Thumbs.db
+
+*.lock
