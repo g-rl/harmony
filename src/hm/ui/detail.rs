@@ -1,0 +1,405 @@
+use eframe::egui;
+
+use crate::hm::analysis::{db, transient};
+use crate::hm::catalog::Source;
+use crate::hm::export::{FORMATS, layout};
+use crate::hm::ui::{theme, widgets};
+
+use crate::hm::app::State;
+
+pub fn panel(ui: &mut egui::Ui, state: &mut State) {
+    egui::ScrollArea::vertical()
+        .id_salt("detail")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            match state.cursor {
+                Some(index) => sound(ui, state, index),
+                None => {
+                    ui.colored_label(theme::DIM, "no sound selected");
+                }
+            }
+            ui.add_space(8.0);
+            widgets::hairline(ui);
+            ui.add_space(6.0);
+            output(ui, state);
+        });
+}
+
+fn sound(ui: &mut egui::Ui, state: &mut State, index: usize) {
+    let Some(entry) = state.catalog.entries.get(index).cloned() else {
+        return;
+    };
+    let package = state
+        .mounted
+        .packages
+        .get(entry.package.0 as usize)
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(theme::TEXT, entry.display());
+    });
+    ui.add_space(4.0);
+    widgets::field(ui, "category", entry.category.label());
+    widgets::field(ui, "package", &package);
+    widgets::field(
+        ui,
+        "language",
+        entry.language.as_deref().unwrap_or("shared"),
+    );
+    match entry.source {
+        Source::Stream { key } => widgets::field(ui, "key", &format!("{key:016x}")),
+        Source::Bank {
+            package: id, index, ..
+        } => widgets::field(ui, "bank", &format!("{}:{index}", id.0)),
+    }
+    widgets::field(ui, "codec", entry.codec.label());
+    widgets::field(ui, "rate", &format!("{} hz", entry.rate));
+    widgets::field(ui, "channels", &entry.channels.to_string());
+    widgets::field(ui, "length", &widgets::seconds(entry.seconds()));
+    widgets::field(ui, "packed", &widgets::bytes(entry.bytes));
+
+    // A sound being read still gets the block, saying so. Taking it away and
+    // putting it back is the panel jumping a frame every time the selection
+    // moves, which is what it looked like.
+    let reading = state
+        .sounding
+        .as_ref()
+        .filter(|sounding| !sounding.against && sounding.index == index)
+        .map(|sounding| sounding.area.clone());
+    if let Some(area) = reading.filter(|_| state.loaded.is_none()) {
+        ui.add_space(6.0);
+        widgets::hairline(ui);
+        ui.add_space(6.0);
+        ui.colored_label(theme::DIM, format!("still loading {area}.."));
+    }
+
+    if let Some(loaded) = state.loaded.as_ref() {
+        ui.add_space(6.0);
+        widgets::hairline(ui);
+        ui.add_space(6.0);
+        let stats = &loaded.stats;
+        widgets::field(ui, "peak", &format!("{:.1} db", db(stats.peak)));
+        widgets::field(ui, "rms", &format!("{:.1} db", db(stats.rms)));
+        widgets::field(ui, "centroid", &format!("{:.0} hz", stats.centroid));
+        widgets::field(
+            ui,
+            "crossings",
+            &widgets::tally(stats.zero_crossings),
+        );
+        widgets::field(ui, "silent", if stats.silence { "yes" } else { "no" });
+        widgets::field(
+            ui,
+            "decoded",
+            &format!(
+                "{} frames {}",
+                widgets::tally(loaded.samples.frames()),
+                widgets::seconds(loaded.samples.seconds())
+            ),
+        );
+        if let Some(marks) = transient::detect(&loaded.samples) {
+            let rate = loaded.samples.rate.max(1) as f32;
+            widgets::field(
+                ui,
+                "attack",
+                &format!("{:.3}s", marks.attack as f32 / rate),
+            );
+            widgets::field(
+                ui,
+                "head/tail",
+                &format!(
+                    "{:.3}s / {:.3}s",
+                    marks.silence_head as f32 / rate,
+                    marks.silence_tail as f32 / rate
+                ),
+            );
+        }
+    }
+
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        let favorite = entry.favorite;
+        if widgets::chip(ui, "favorite", favorite).clicked() {
+            state.toggle_favorite(index);
+        }
+        if ui.button("extract").clicked() {
+            state.selection.clear();
+            state.selection.insert(index);
+            state.extract(false);
+        }
+        if ui.button("copy name").clicked() {
+            ui.ctx().copy_text(entry.display());
+        }
+        if ui.button("select all shown").clicked() {
+            state.selection = state.filtered.iter().copied().collect();
+        }
+    });
+
+    if !entry.tags.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for tag in &entry.tags {
+                ui.colored_label(theme::ACCENT, tag);
+            }
+        });
+    }
+
+    similar(ui, state, index);
+}
+
+
+fn similar(ui: &mut egui::Ui, state: &mut State, _index: usize) {
+    ui.add_space(6.0);
+    widgets::hairline(ui);
+    ui.add_space(4.0);
+    ui.colored_label(theme::DIM, "similar");
+
+    let ranked = state.similar.clone();
+    if ranked.is_empty() {
+        ui.colored_label(theme::DIM, "nothing to compare with");
+        return;
+    }
+    let mut clicked = None;
+    for (score, other) in ranked {
+        let Some(entry) = state.catalog.entries.get(other) else {
+            continue;
+        };
+        let package = state
+            .mounted
+            .packages
+            .get(entry.package.0 as usize)
+            .cloned()
+            .unwrap_or_default();
+        let text = format!(
+            "{}  {}  {:.2}",
+            crate::hm::discord::clip(&entry.display(), 18),
+            crate::hm::discord::clip(&package, 16),
+            score
+        );
+        if ui
+            .selectable_label(false, egui::RichText::new(text).color(theme::DIM))
+            .clicked()
+        {
+            clicked = Some(other);
+        }
+    }
+    if let Some(other) = clicked {
+        state.select(other, true);
+    }
+}
+
+fn output(ui: &mut egui::Ui, state: &mut State) {
+    ui.colored_label(theme::DIM, "output");
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        for format in FORMATS {
+            if widgets::chip(ui, format.label(), state.options.format == *format).clicked() {
+                state.options.format = *format;
+                state.save_options();
+            }
+        }
+    });
+    egui::ComboBox::from_id_salt("layout")
+        .selected_text(state.options.layout.label())
+        .width(180.0)
+        .show_ui(ui, |ui| {
+            for choice in layout::ALL {
+                if ui
+                    .selectable_label(state.options.layout == *choice, choice.label())
+                    .clicked()
+                {
+                    state.options.layout = *choice;
+                    state.save_options();
+                }
+            }
+        });
+
+    let mut changed = false;
+    changed |= ui
+        .checkbox(&mut state.options.preserve_paths, "keep folders")
+        .changed();
+    changed |= ui
+        .checkbox(&mut state.options.normalise_names, "safe names")
+        .changed();
+    changed |= ui
+        .checkbox(&mut state.options.skip_duplicates, "skip existing")
+        .changed();
+    changed |= ui
+        .checkbox(&mut state.options.write_manifest, "write manifest")
+        .changed();
+    if changed {
+        state.save_options();
+    }
+
+    ui.horizontal(|ui| {
+        if ui.button("folder").clicked()
+            && let Some(folder) = rfd::FileDialog::new().pick_folder()
+        {
+            state.set_output_dir(folder);
+        }
+        let shown = state
+            .output
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| "ask each time".into());
+        ui.colored_label(theme::DIM, crate::hm::discord::clip(&shown, 30));
+    });
+
+    folders(ui, state);
+
+    presets(ui, state);
+
+    ui.horizontal(|ui| {
+        if ui.button("extract shown").clicked() {
+            state.selection.clear();
+            state.extract(true);
+        }
+        if !state.selection.is_empty()
+            && ui
+                .button(format!("extract {}", state.selection.len()))
+                .clicked()
+        {
+            state.extract(false);
+        }
+    });
+
+    let mut discord = state.settings.discord;
+    if ui.checkbox(&mut discord, "discord presence").changed() {
+        state.settings.discord = discord;
+        crate::hm::storage::save(&state.settings);
+        if discord {
+            state.rpc = crate::hm::discord::Rpc::new(&state.settings.discord_app_id);
+            state.push_presence();
+        } else {
+            state.rpc = crate::hm::discord::Rpc::disabled();
+        }
+    }
+}
+
+
+/// Where harmony writes, and how much room is left there.
+///
+/// Three folders, and every one of them can be moved: the caches a scan
+/// leaves, the scratch files a drag out of the window needs, and the folder an
+/// extraction lands in. Each line says what is free on that disk, because the
+/// number only matters where the writing happens.
+fn folders(ui: &mut egui::Ui, state: &mut State) {
+    ui.add_space(6.0);
+    widgets::hairline(ui);
+    ui.add_space(6.0);
+    ui.colored_label(theme::DIM, "folders");
+
+    let cache = crate::hm::storage::cache_dir();
+    let disk = state.disk.clone();
+    row(
+        ui,
+        "cache",
+        &cache,
+        disk.cache_free,
+        Some(disk.cache_held),
+        state.settings.cache_dir.is_some(),
+    );
+    ui.horizontal(|ui| {
+        if ui.small_button("move cache").clicked()
+            && let Some(folder) = rfd::FileDialog::new()
+                .set_title("where should scans be cached?")
+                .pick_folder()
+        {
+            state.set_cache_dir(Some(folder));
+        }
+        if state.settings.cache_dir.is_some() && ui.small_button("default").clicked() {
+            state.set_cache_dir(None);
+        }
+    });
+
+    let scratch = crate::hm::window::dragout::scratch_dir();
+    row(
+        ui,
+        "scratch",
+        &scratch,
+        disk.scratch_free,
+        None,
+        state.settings.temp_dir.is_some(),
+    );
+    ui.horizontal(|ui| {
+        if ui.small_button("move scratch").clicked()
+            && let Some(folder) = rfd::FileDialog::new()
+                .set_title("where should drag-out files be written?")
+                .pick_folder()
+        {
+            state.set_temp_dir(Some(folder));
+        }
+        if state.settings.temp_dir.is_some() && ui.small_button("default").clicked() {
+            state.set_temp_dir(None);
+        }
+    });
+
+    match state.output.clone() {
+        Some(path) => row(ui, "export", &path, disk.export_free, None, true),
+        None => widgets::field(ui, "export", "ask each time"),
+    }
+}
+
+/// One folder line: where it is, what is free on that disk, and whether the
+/// user chose it or harmony fell back to its own default.
+fn row(
+    ui: &mut egui::Ui,
+    label: &str,
+    path: &std::path::Path,
+    free: Option<u64>,
+    holding: Option<u64>,
+    chosen: bool,
+) {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    ui.horizontal(|ui| {
+        ui.colored_label(theme::DIM, label);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let room = match free {
+                Some(bytes) => format!("{} free", widgets::bytes(bytes)),
+                None => "room unknown".to_string(),
+            };
+            let colour = match free {
+                Some(bytes) if bytes < crate::hm::storage::space::HEADROOM => theme::UNLIT,
+                Some(_) => theme::GOOD,
+                None => theme::DIM,
+            };
+            ui.colored_label(colour, room);
+            if let Some(bytes) = holding.filter(|bytes| *bytes > 0) {
+                ui.colored_label(theme::DIM, format!("{} held", widgets::bytes(bytes)));
+            }
+        });
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(
+            if chosen { theme::TEXT } else { theme::DIM },
+            crate::hm::discord::clip(&text, 44),
+        )
+        .on_hover_text(text);
+    });
+}
+
+/// Extraction presets: a named format, layout and set of switches.
+fn presets(ui: &mut egui::Ui, state: &mut State) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.colored_label(theme::DIM, "preset");
+        let names: Vec<String> = state.settings.presets.keys().cloned().collect();
+        egui::ComboBox::from_id_salt("preset")
+            .selected_text(if names.is_empty() { "none saved" } else { "apply" })
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for name in names {
+                    if ui.selectable_label(false, &name).clicked() {
+                        state.apply_preset(&name);
+                    }
+                }
+            });
+        ui.add_sized(
+            egui::vec2(90.0, theme::INTERACT_HEIGHT),
+            egui::TextEdit::singleline(&mut state.preset_name).hint_text("name"),
+        );
+        if ui.button("save").clicked() {
+            let name = state.preset_name.clone();
+            state.save_preset(&name);
+        }
+    });
+}

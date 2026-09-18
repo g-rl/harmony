@@ -1,0 +1,22 @@
+# build
+/target/
+/dist/
+
+# reference material - other people's repositories, read and not shipped
+/refs/
+
+# machine-local
+/.claude/settings.local.json
+/scratchpad/
+
+# internal
+/PLAN.md
+/TASKS.md
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.bat
+.DS_Store
+Thumbs.db
