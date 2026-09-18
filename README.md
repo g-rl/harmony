@@ -13,9 +13,11 @@ whole of what it is.
 | --- | --- | --- | --- | --- | --- |
 | mwiii | modern warfare iii | `jup` | verified | `cod23\`, `zone\` | kapi `.xpak` / `.xsub` |
 | mwii | modern warfare ii | `iw9` | expected | `zone\`, `sp22\`, `mp22\` | kapi |
+| cw | black ops cold war | `t9` | expected | `zone\` | kapi `.xsub`, oodle blocks, opus inside |
 | mw19 | modern warfare 2019 | `iw8` | detect only | `zone\` | kapi |
 | bo6 | black ops 6 | `t10` | detect only | `zone\` | kapi |
 | bo7 | black ops 7 | `t11` | detect only | `zone\` | kapi |
+| bo4 | black ops 4 | `t8` | expected | `zone\snd\<language>\` in casc | battle.net casc, sab banks (`.sabs`, `.sabl`), flac |
 | bo3 | black ops iii | `t7` | verified | `zone\snd\<language>\` | sab banks (`.sabs`, `.sabl`), flac |
 | bo2 | black ops ii | `t6` | verified | `sound\` | sab banks (`.sabs`, `.sabl`) |
 | bo1 | black ops | `t5` | verified | `main\` | `.iwd` archives, ms-adpcm |
@@ -23,6 +25,7 @@ whole of what it is.
 | mw3 | modern warfare 3 | `iw5` | partial | `zone\`, `zone\<language>\` | `.ff` fastfiles, pcm inside |
 | ghosts | ghosts | `iw6` | partial | `zone\**\soundfile*.pak` | flac streams |
 | aw | advanced warfare | `s1` | partial | `zone\**\soundfile*.pak` | flac streams |
+| wwii | wwii | `s2` | partial | install folder, `<language>\` | `soundfile*.pak`, flac streams |
 | mwr | modern warfare remastered | `h1` | partial | install folder, `<language>\` | `soundfile*.pak`, flac streams |
 | mw2cr | mw2 campaign remastered | `h2` | partial | `Data\data\` | battle.net casc, flac streams |
 | mw2 | modern warfare 2 | `iw4` | verified | `main\`, `zone\` | `.iwd` archives and `.ff` fastfiles |

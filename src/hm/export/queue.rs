@@ -244,7 +244,7 @@ pub fn run_one(
         }
         Format::Ogg => {
             let stream = opus::probe(&raw).ok_or_else(|| "not an opus stream".to_string())?;
-            let packets: Vec<&[u8]> = opus::packets(&raw, stream.seek_table).collect();
+            let packets: Vec<&[u8]> = opus::packets_of(&raw, &stream).collect();
             ogg::write(&path, &packets, stream.channels, opus::FRAME as u32)
                 .map_err(|e| e.to_string())?;
         }

@@ -14,11 +14,23 @@ pub const MAGIC: &[u8; 4] = b"TVFS";
 #[derive(Clone, Debug)]
 pub struct File {
     pub path: String,
+    /// The key of the first span, which is the whole file for all but the
+    /// biggest.
     pub ekey: Vec<u8>,
-    /// The size of the stored file the span points into.
+    /// How many bytes the file is, all its spans together.
     pub size: u32,
-    /// Where in that file this one starts, for the rare file made of spans.
+    /// The pieces the file is stored as. A sound bank past a gigabyte is cut
+    /// into several, each its own blob; everything smaller is one span.
+    pub spans: Vec<Span>,
+}
+
+/// One stored piece of a file: where it starts in the file, how long it is,
+/// and the blob that holds it.
+#[derive(Clone, Debug)]
+pub struct Span {
     pub offset: u32,
+    pub size: u32,
+    pub ekey: Vec<u8>,
 }
 
 struct Header {
@@ -127,35 +139,49 @@ fn walk(
     Ok(())
 }
 
-/// The span table entry a file node points at, and the container entry behind
-/// it. Only the first span of a file is followed: harmony reads whole files.
+/// The span table entry a file node points at, and the container entries
+/// behind its spans.
 fn span(raw: &[u8], head: &Header, at: usize, path: &str) -> Option<File> {
     let vfs = raw.get(head.vfs_at..head.vfs_at + head.vfs_size)?;
     let entry = vfs.get(at..)?;
     if entry.len() < 1 {
         return None;
     }
-    let spans = entry[0] as usize;
-    if spans == 0 {
+    let count = entry[0] as usize;
+    if count == 0 {
         return None;
     }
     let cft_width = offset_width(head.cft_size);
-    let body = entry.get(1..1 + 8 + cft_width)?;
-    let offset = u32::from_be_bytes(body[0..4].try_into().ok()?);
-    let size = u32::from_be_bytes(body[4..8].try_into().ok()?);
-    let cft_at = be(&body[8..8 + cft_width]) as usize;
-
     let cft = raw.get(head.cft_at..head.cft_at + head.cft_size)?;
-    let ekey = cft.get(cft_at..cft_at + head.ekey_size)?.to_vec();
     // Harmony never writes to a storage, so the patch and content key fields
     // that may follow the key are of no use here.
     let _ = head.flags;
 
+    // Each span's own offset field is where it starts in its blob, which is
+    // zero for every one of them: the spans follow each other, and where one
+    // starts in the file is the sum of those before it.
+    let row = 8 + cft_width;
+    let mut spans = Vec::with_capacity(count);
+    let mut offset = 0u64;
+    for i in 0..count {
+        let body = entry.get(1 + i * row..1 + (i + 1) * row)?;
+        let size = u32::from_be_bytes(body[4..8].try_into().ok()?);
+        let cft_at = be(&body[8..8 + cft_width]) as usize;
+        let ekey = cft.get(cft_at..cft_at + head.ekey_size)?.to_vec();
+        spans.push(Span {
+            offset: offset.min(u32::MAX as u64) as u32,
+            size,
+            ekey,
+        });
+        offset += size as u64;
+    }
+    let size = offset.min(u32::MAX as u64) as u32;
+
     Some(File {
         path: path.trim_start_matches('/').to_ascii_lowercase(),
-        ekey,
+        ekey: spans[0].ekey.clone(),
         size,
-        offset,
+        spans,
     })
 }
 

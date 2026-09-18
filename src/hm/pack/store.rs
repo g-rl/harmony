@@ -272,6 +272,27 @@ pub struct SabSet {
 impl SabSet {
     pub fn mount(&mut self, path: &Path) -> Result<PackageId> {
         let bank = sab::open(path)?;
+        Ok(self.take(path, bank))
+    }
+
+    /// A bank that is a blob in casc rather than a file: black ops 4 keeps
+    /// its banks under `zone\snd\` the way black ops iii does, but inside
+    /// battle.net's storage rather than on disk.
+    pub fn mount_casc(
+        &mut self,
+        storage: std::sync::Arc<crate::hm::pack::casc::Storage>,
+        file: &crate::hm::pack::casc::tvfs::File,
+    ) -> Result<PackageId> {
+        let path = storage.root().join(&file.path);
+        let source = sab::Source::Casc {
+            storage,
+            spans: file.spans.clone(),
+        };
+        let bank = sab::open_source(source, file.size as u64)?;
+        Ok(self.take(&path, bank))
+    }
+
+    fn take(&mut self, path: &Path, bank: sab::Bank) -> PackageId {
         let id = PackageId(self.banks.len() as u32);
         self.info.push(PackageInfo {
             id,
@@ -285,7 +306,7 @@ impl SabSet {
             kind: 0,
         });
         self.banks.push(bank);
-        Ok(id)
+        id
     }
 
     fn listing(&mut self, id: PackageId) -> Vec<Listing> {

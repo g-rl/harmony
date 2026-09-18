@@ -10,7 +10,7 @@ use crate::hm::pack::PackageId;
 use crate::hm::pack::kapi::Package;
 use crate::hm::pack::oodle::Oodle;
 use crate::hm::pack::store::Store;
-use crate::hm::sound::{Codec, opus};
+use crate::hm::sound::{Codec, decode, opus};
 
 /// How much of a blob the scanner reads before deciding what it is: enough for
 /// a header, a seek table of a few hundred packets and the first packets.
@@ -212,7 +212,7 @@ fn relay(
 /// `i64`, then the size. Stored sounds have no header at all and open straight
 /// into their seek table: a zero word followed by rising byte offsets.
 pub fn looks_like_sound(head: &[u8]) -> bool {
-    packed_head(head) || stored_head(head)
+    packed_head(head) || stored_head(head) || opus::t9_head(head) || decode::flac_shape(head).is_some()
 }
 
 fn packed_head(head: &[u8]) -> bool {
@@ -403,6 +403,15 @@ fn walk_kapi(
                         let Ok(head) = package.read_head(entry, oodle.as_deref(), HEAD) else {
                             continue;
                         };
+                        // Black ops cold war streams flac rather than opus, and
+                        // says so in the first four bytes.
+                        if let Some(found_flac) = flac_entry(&head, entry, id, index, &language) {
+                            found.push(found_flac);
+                            if found.len() >= 256 {
+                                let _ = tx.send(Msg::Found(std::mem::take(&mut found)));
+                            }
+                            continue;
+                        }
                         if !looks_like_sound(&head) {
                             continue;
                         }
@@ -457,6 +466,43 @@ fn walk_kapi(
             });
         }
     });
+}
+
+/// A kapi entry that is a whole flac stream, as black ops cold war keeps them:
+/// the shape is in the stream info block, so nothing has to be decoded.
+fn flac_entry(
+    head: &[u8],
+    entry: crate::hm::pack::kapi::Entry,
+    package: PackageId,
+    index: usize,
+    language: &Option<String>,
+) -> Option<Entry> {
+    let (rate, channels) = decode::flac_shape(head)?;
+    if rate == 0 || channels == 0 {
+        return None;
+    }
+    let frames = decode::flac_frames(head);
+    let name_text = Name::Key(entry.key);
+    let seconds = frames as f32 / rate as f32;
+    Some(Entry {
+        id: SoundId(0),
+        category: classify(&name_text, language.as_ref(), channels, seconds),
+        sub: crate::hm::catalog::sub_for(&name_text),
+        lower: name_text.text().to_ascii_lowercase(),
+        name: name_text,
+        source: Source::Stream { key: entry.key },
+        package,
+        index: index as u32,
+        codec: Codec::Flac,
+        rate,
+        channels,
+        frames,
+        bytes: entry.size as u64,
+        language: language.clone(),
+        facets: Facets::default(),
+        favorite: false,
+        tags: Vec::new(),
+    })
 }
 
 /// The catalogue of a container that already knows what it holds: iwd archives,

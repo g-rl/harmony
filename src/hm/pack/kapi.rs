@@ -113,13 +113,20 @@ impl Package {
         }
 
         let count = header.hash_count as usize;
+        // A row is a key and a packed word, and the newer titles pad each one
+        // out to twenty bytes: black ops cold war writes them sixteen apart.
+        // The header's own sizes say which.
+        let stride = match (header.hash_size as usize).checked_div(count) {
+            Some(stride) if (16..=32).contains(&stride) => stride,
+            _ => ENTRY_SIZE,
+        };
         file.seek(SeekFrom::Start(header.hash_offset))?;
-        let mut table = vec![0u8; count * ENTRY_SIZE];
+        let mut table = vec![0u8; count * stride];
         file.read_exact(&mut table)?;
 
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
-            let at = i * ENTRY_SIZE;
+            let at = i * stride;
             let packed = u64at(&table, at + 8);
             entries.push(Entry {
                 key: u64at(&table, at),
@@ -198,6 +205,9 @@ impl Package {
     fn read_upto(&mut self, entry: Entry, oodle: Option<&Oodle>, want: usize) -> Result<Vec<u8>> {
         if entry.size == 0 {
             return Err(anyhow!("empty entry"));
+        }
+        if self.header.version == T9_VERSION {
+            return self.read_t9(entry, oodle, want);
         }
 
         // A block chain starts with the entry's own key; anything else is
@@ -295,4 +305,59 @@ impl Package {
         out.truncate(written);
         Ok(out)
     }
+
+    /// Black ops cold war's entry: a count of blocks, a word per block with
+    /// its packed size in the low twenty-four bits and how it was packed in
+    /// the top eight, the table rounded up to the next hundred and twenty-
+    /// eight bytes, and then the blocks one after another. Each block starts
+    /// with its own plain size, and is oodle after that.
+    fn read_t9(&mut self, entry: Entry, oodle: Option<&Oodle>, want: usize) -> Result<Vec<u8>> {
+        let count = u64at(self.fetch(entry.offset, 8)?, 0) as usize;
+        if count == 0 || count > T9_BLOCKS_MOST {
+            return Err(anyhow!("not a block table"));
+        }
+        let words = self.fetch(entry.offset + 8, count * 4)?.to_vec();
+        let table = ((8 + count * 4 + 0x7F) & !0x7F) as u64;
+        let end = entry.offset + entry.size as u64;
+        let mut block_at = entry.offset + table;
+        let mut out = Vec::new();
+        for i in 0..count {
+            let word = u32at(&words, i * 4);
+            let packed = (word & 0x00FF_FFFF) as usize;
+            let kind = word >> 24;
+            if packed < 4 || block_at + packed as u64 > end {
+                break;
+            }
+            let plain = u32at(self.fetch(block_at, 4)?, 0) as usize;
+            if plain == 0 || plain > MAX_BLOB {
+                break;
+            }
+            let src = self.fetch(block_at + 4, packed - 4)?.to_vec();
+            match kind {
+                T9_OODLE => {
+                    let oodle = oodle.ok_or_else(|| anyhow!("oodle needed, none loaded"))?;
+                    let at = out.len();
+                    out.resize(at + plain, 0);
+                    oodle.run(&src, &mut out[at..at + plain])?;
+                }
+                _ if packed - 4 == plain => out.extend_from_slice(&src),
+                other => return Err(anyhow!("block kind {other} is not one harmony reads")),
+            }
+            block_at += packed as u64;
+            if out.len() >= want {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err(anyhow!("nothing came out of the block table"));
+        }
+        Ok(out)
+    }
 }
+
+/// The header version black ops cold war writes.
+pub const T9_VERSION: u16 = 16;
+/// The kind byte of an oodle block in a cold war entry.
+const T9_OODLE: u32 = 9;
+/// More blocks than any entry has: past this, the count is not a count.
+const T9_BLOCKS_MOST: usize = 0x10000;

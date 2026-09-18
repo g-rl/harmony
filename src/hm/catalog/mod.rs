@@ -207,6 +207,19 @@ pub fn language_of(package: &str) -> Option<String> {
         ("kop_", "portuguese"),
         ("chi_", "chinese"),
         ("ww_", "worldwide"),
+        // Black ops 4 and cold war spell them in two letters.
+        ("en_", "english"),
+        ("fr_", "french"),
+        ("fj_", "french"),
+        ("ge_", "german"),
+        ("it_", "italian"),
+        ("es_", "spanish"),
+        ("ea_", "spanish"),
+        ("ru_", "russian"),
+        ("po_", "polish"),
+        ("bp_", "portuguese"),
+        ("ko_", "korean"),
+        ("ms_", "chinese"),
     ];
     let lower = package.to_ascii_lowercase();
     CODES

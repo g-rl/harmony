@@ -1040,6 +1040,7 @@ fn stream(path: &std::path::Path) {
                     packets,
                     channels: if (raw[start + 2] >> 2) & 1 == 1 { 2 } else { 1 },
                     frames: (packets * hm::sound::opus::FRAME) as u64,
+                    wide: false,
                 };
                 match hm::sound::opus::decode(&raw, guess) {
                     Ok(pcm) => {

@@ -42,8 +42,39 @@ pub struct BankEntry {
 pub struct Bank {
     pub header: BankHeader,
     pub entries: Vec<BankEntry>,
-    file: std::fs::File,
+    source: Source,
     len: u64,
+}
+
+/// Where a bank's bytes come from: a file on disk, or a blob in a battle.net
+/// casc storage that is read a block at a time.
+pub enum Source {
+    File(std::fs::File),
+    Casc {
+        storage: std::sync::Arc<crate::hm::pack::casc::Storage>,
+        spans: Vec<crate::hm::pack::casc::tvfs::Span>,
+    },
+}
+
+impl Source {
+    fn read_at(&self, at: u64, size: usize) -> Result<Vec<u8>> {
+        match self {
+            Source::File(file) => {
+                let mut out = vec![0u8; size];
+                let mut file = file;
+                file.seek(SeekFrom::Start(at))?;
+                file.read_exact(&mut out)?;
+                Ok(out)
+            }
+            Source::Casc { storage, spans } => {
+                let out = storage.read_range(spans, at, size)?;
+                if out.len() < size {
+                    return Err(anyhow!("the bank is cut short in casc"));
+                }
+                Ok(out)
+            }
+        }
+    }
 }
 
 impl Bank {
@@ -52,11 +83,7 @@ impl Bank {
         if at.saturating_add(size as u64) > self.len {
             return Err(anyhow!("entry runs past the end of the bank"));
         }
-        let mut out = vec![0u8; size];
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(at))?;
-        file.read_exact(&mut out)?;
-        Ok(out)
+        self.source.read_at(at, size)
     }
 
     pub fn len(&self) -> u64 {
@@ -104,10 +131,14 @@ const HEAD: usize = 0x400;
 const NAMES_MOST: u64 = 32 << 20;
 
 pub fn open(path: &Path) -> Result<Bank> {
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let mut head = vec![0u8; HEAD.min(len as usize)];
-    file.read_exact(&mut head)?;
+    open_source(Source::File(file), len)
+}
+
+/// A bank wherever its bytes are, given how many there are.
+pub fn open_source(source: Source, len: u64) -> Result<Bank> {
+    let head = source.read_at(0, HEAD.min(len as usize))?;
 
     let header = read_header(&head).ok_or_else(|| anyhow!("not a sab bank"))?;
     let count = header.entry_count as usize;
@@ -124,7 +155,11 @@ pub fn open(path: &Path) -> Result<Bank> {
         }
         false => 0,
     };
-    let names = match names_at > 0 && names_at < len {
+    // Black ops 4 keeps a table where the names were, but it holds the
+    // sixty-four bit hash of each name padded out to a hundred and twenty-
+    // eight bytes: the key again, and nothing to print.
+    let hashed = header.version == 0x15 && header.entry_size == 0x30;
+    let names = match names_at > 0 && names_at < len && !hashed {
         true => {
             // Everything from the names to whatever table comes after them.
             // The header's `name_size` is not the stride — infinite warfare
@@ -137,12 +172,14 @@ pub fn open(path: &Path) -> Result<Bank> {
                 .min()
                 .unwrap_or(len);
             let want = (after - names_at).min(NAMES_MOST) as usize;
-            read_names(&span(&mut file, names_at, want)?, count)
+            read_names(&source.read_at(names_at, want)?, count)
         }
         false => Vec::new(),
     };
 
-    let table_at = match header.version == 0x15 {
+    // Infinite warfare's header has no padding word before the file size,
+    // so its entry offset sits four bytes earlier than black ops 4's.
+    let table_at = match header.version == 0x15 && header.entry_size != 0x30 {
         true => u64at(&head, 36),
         false => header.entry_offset,
     };
@@ -150,8 +187,7 @@ pub fn open(path: &Path) -> Result<Bank> {
     if table_at >= len {
         return Err(anyhow!("truncated bank"));
     }
-    let table = span(
-        &mut file,
+    let table = source.read_at(
         table_at,
         ((count as u64 * stride).min(len - table_at)) as usize,
     )?;
@@ -160,16 +196,9 @@ pub fn open(path: &Path) -> Result<Bank> {
     Ok(Bank {
         header,
         entries,
-        file,
+        source,
         len,
     })
-}
-
-fn span(file: &mut std::fs::File, at: u64, size: usize) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; size];
-    file.seek(SeekFrom::Start(at))?;
-    file.read_exact(&mut out)?;
-    Ok(out)
 }
 
 /// `aliens\brute_swipe_01` as everything else here spells it.
@@ -244,6 +273,21 @@ fn read_entries(table: &[u8], header: &BankHeader, names: &[String]) -> Vec<Bank
                 channels: e[17],
                 looping: e[18] != 0,
                 format: e[19],
+                seek_table: 0,
+                primed: 0,
+                name: names.get(i).map(|name| slashed(name)),
+            },
+            // Black ops 4: black ops iii's row with a sixty-four bit key in
+            // front of it, and the shape bytes at the end.
+            (0x15, 0x30) => BankEntry {
+                key: u64at(e, 0),
+                offset: u64at(e, 16),
+                size: u32at(e, 24),
+                frames: u32at(e, 28),
+                rate: RATES.get(e[40] as usize).copied().unwrap_or(48000),
+                channels: e[41],
+                looping: e[42] != 0,
+                format: e[43],
                 seek_table: 0,
                 primed: 0,
                 name: names.get(i).map(|name| slashed(name)),

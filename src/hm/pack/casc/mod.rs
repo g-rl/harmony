@@ -121,6 +121,90 @@ impl Storage {
         blte::decode(&raw[ENTRY_HEADER..])
     }
 
+    /// `size` bytes from `at` in a file, decoding only the blocks that cover
+    /// them.
+    ///
+    /// A sound bank is read this way: its header is in the first kilobyte, its
+    /// tables at the far end, and a single sound somewhere between, so the
+    /// hundreds of megabytes in the middle stay on the disk. A file cut into
+    /// spans is read across them.
+    pub fn read_range(&self, spans: &[tvfs::Span], at: u64, size: usize) -> Result<Vec<u8>> {
+        let end = at.saturating_add(size as u64);
+        let mut out = Vec::with_capacity(size);
+        let mut next = at;
+        for span in spans {
+            let from = span.offset as u64;
+            let to = from + span.size as u64;
+            if to <= next || from >= end {
+                continue;
+            }
+            if from > next {
+                return Err(anyhow!("a gap between the spans of this file"));
+            }
+            let want = (end.min(to) - next) as usize;
+            let piece = self.read_key_range(&span.ekey, next - from, want)?;
+            if piece.len() < want {
+                return Err(anyhow!("a span of this file is cut short"));
+            }
+            out.extend_from_slice(&piece);
+            next = end.min(to);
+            if next >= end {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// `size` bytes from `at` in one blob, decoding only the blocks that cover
+    /// them.
+    fn read_key_range(&self, ekey: &[u8], at: u64, size: usize) -> Result<Vec<u8>> {
+        let place = self
+            .index
+            .find(ekey)
+            .ok_or_else(|| anyhow!("that key is not in this install"))?;
+        let path = self.data.join(format!("data.{:03}", place.archive));
+        let mut file = std::fs::File::open(&path)?;
+        let start = place.offset + ENTRY_HEADER as u64;
+        let mut fetch = |from: u64, len: usize| -> Result<Vec<u8>> {
+            let mut raw = vec![0u8; len];
+            file.seek(SeekFrom::Start(start + from))?;
+            file.read_exact(&mut raw)?;
+            Ok(raw)
+        };
+        let head = fetch(0, 8)?;
+        let table_len = blte::table_len(&head)?;
+        let table = blte::table(&fetch(0, table_len)?)?;
+        // A headerless stream is one block whose plain size is only known
+        // once it is decoded: read it whole.
+        if table.blocks.iter().any(|(_, plain)| *plain == 0) {
+            let whole = self.read_key(ekey)?;
+            let from = (at as usize).min(whole.len());
+            let to = from.saturating_add(size).min(whole.len());
+            return Ok(whole[from..to].to_vec());
+        }
+        let end = at.saturating_add(size as u64);
+        let mut out = Vec::with_capacity(size);
+        let mut packed_at = table.header_size as u64;
+        let mut plain_at = 0u64;
+        for (packed, plain) in &table.blocks {
+            let plain_end = plain_at + *plain as u64;
+            if plain_end > at && plain_at < end {
+                let block = blte::decode_block(&fetch(packed_at, *packed)?)?;
+                let from = at.saturating_sub(plain_at) as usize;
+                let to = (end - plain_at).min(block.len() as u64) as usize;
+                if from < to {
+                    out.extend_from_slice(&block[from..to]);
+                }
+            }
+            if plain_end >= end {
+                break;
+            }
+            packed_at += *packed as u64;
+            plain_at = plain_end;
+        }
+        Ok(out)
+    }
+
     /// Read one file out of the storage by its path.
     pub fn read_path(&self, path: &str) -> Result<Vec<u8>> {
         let wanted = path.to_ascii_lowercase();

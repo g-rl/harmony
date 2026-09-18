@@ -445,6 +445,21 @@ pub fn all() -> Vec<Box<dyn Title>> {
             strict: true,
         }),
         Box::new(Legacy {
+            id: TitleId::S2,
+            label: "wwii",
+            status: Support::Partial,
+            kind: Kind::Pak,
+            // WWII is advanced warfare's engine with remastered's layout: the
+            // paks beside the executable, and the voice ones again under a
+            // folder per installed language, `english\eng_soundfileNN.pak`.
+            roots: &[HERE],
+            exts: &["pak"],
+            stems: &["soundfile"],
+            markers: &["s2_mp", "s2_sp", "__s2exe"],
+            not: &["iw6", "codwaw", "h1_", "s1_"],
+            strict: true,
+        }),
+        Box::new(Legacy {
             id: TitleId::S1,
             label: "advanced warfare",
             status: Support::Partial,
