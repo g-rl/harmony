@@ -29,6 +29,10 @@ pub struct Settings {
     pub tags: HashMap<String, Vec<String>>,
     pub collections: HashMap<String, Vec<String>>,
     pub scans: HashMap<String, Scan>,
+    /// Buckets left out of a library extract, by the name the window shows:
+    /// a dump of everything that skips the voice folder is still a dump.
+    #[serde(default)]
+    pub skip: Vec<String>,
     /// Name lists the user pointed harmony at. Harmony ships none of its own.
     #[serde(default)]
     pub name_files: Vec<PathBuf>,
@@ -86,6 +90,7 @@ impl Default for Settings {
             tags: HashMap::new(),
             collections: HashMap::new(),
             scans: HashMap::new(),
+            skip: Vec::new(),
             name_files: Vec::new(),
             presets: HashMap::new(),
             roots: HashMap::new(),
@@ -122,6 +127,58 @@ impl Settings {
             _ => Layout::CategoryPackage,
         }
     }
+}
+
+
+/// An export that was put down rather than finished.
+///
+/// Harmony does not keep a list of which sounds got written — the folder on
+/// disk is that list, and it is more reliable than anything harmony could
+/// remember. What is kept is what the run was: which game, which folder, which
+/// format and tree, and what was being left out. Picking it up again means
+/// running the same thing with `skip existing` turned on, so every file that is
+/// already there is stepped over and the run carries on from where it stopped.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Resume {
+    /// The title id, so the button only appears for the game it belongs to.
+    pub game: String,
+    pub label: String,
+    /// The install it was read from, and the folder it was written into.
+    pub root: PathBuf,
+    pub into: PathBuf,
+    pub folder: String,
+    pub format: String,
+    pub layout: String,
+    pub normalise_names: bool,
+    pub write_manifest: bool,
+    pub skip: Vec<String>,
+    pub done: usize,
+    pub failed: usize,
+    pub total: usize,
+    pub at: String,
+}
+
+pub fn resume_path() -> PathBuf {
+    config_dir().join("resume.json")
+}
+
+pub fn load_resume() -> Option<Resume> {
+    let text = std::fs::read_to_string(resume_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_resume(resume: &Resume) {
+    let path = resume_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(resume) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+pub fn clear_resume() {
+    let _ = std::fs::remove_file(resume_path());
 }
 
 pub fn config_dir() -> PathBuf {

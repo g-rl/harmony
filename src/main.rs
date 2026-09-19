@@ -1124,6 +1124,15 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
         options.format = format;
         options.write_manifest = true;
         let folder = out.join(format.label());
+        let _ = std::fs::create_dir_all(&folder);
+        // The same log a library run leaves, so the headless run tests the
+        // thing the window does rather than a shorter path through it.
+        let mut log = hm::export::liblog::Log::new(&folder);
+        log.say(format!("harmony pull  \u{b7} {}", hm::storage::stamp()));
+        log.say(format!("from      {}", root.display()));
+        log.say(format!("format    {}", format.label()));
+        log.say(format!("sounds    {}", entries.len()));
+        log.blank();
         queue.start(
             mount.clone(),
             entries.clone(),
@@ -1131,6 +1140,7 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
             "jup".into(),
             folder.clone(),
             options,
+            Some(log),
         );
         loop {
             let progress = queue.progress.lock().unwrap();

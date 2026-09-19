@@ -116,7 +116,22 @@ Harmony fingerprints the folder, says what it found and how it knows, and then:
   written by every core the machine can spare bar two, and the queue window stops listing a
   row per sound: it shows how fast it is going, how much has landed, how long is left, the
   last few names and the failures, which is what a run of a hundred thousand is actually
-  watched by.
+  watched by. It leaves a `liblog.txt` in the folder saying what it was told to do, what it
+  left out, everything that failed and why, and how long it all took — rewritten as it
+  goes, so a run that is killed outright still leaves a readable log.
+- **leave out** ticks whole buckets off a library run: a dump of everything that skips the
+  voice folder is still a dump, and it should not take a search term to get one. The chips
+  are the buckets this catalogue actually holds, with their counts, and what is ticked is
+  remembered between runs. `voice` is matched both ways — the bucket harmony filed a sound
+  under, and the first folder of the sound's own name — because on some titles it is one
+  and on some it is the other. Only the library run leaves anything out; `extract shown`
+  writes exactly what is on screen.
+- **closing while something is running** asks first. An export can be put down rather than
+  thrown away: harmony writes what the run was — game, folder, format, tree, what was left
+  out — and the next time that game is open there is a **resume export** button that runs
+  the same thing again with `skip existing` on, so every file already written is stepped
+  over and the rest carries on. What is not written down is which sounds got written: the
+  folder on disk is that list, and it cannot fall out of step the way a list could.
 - **folder tree** is one ladder of five, shallowest first: `file only` writes straight into
   the export folder, `sound path` keeps the folders the sound's own name carries, and
   `package`, `category/package` and `language/category` put one more level above that. The
@@ -256,7 +271,8 @@ harmony --sort <game key> <depth>              # how a cached scan files itself
 
 `%APPDATA%\harmony\`: `settings.json` (the folder remembered for each game, output,
 favorites, tags, collections, presets, window size) and `scan-<game>-<depth>.json` (the cached catalogue of a scan) and
-`zones-<game>.json` (what each fastfile turned out to hold).
+`zones-<game>.json` (what each fastfile turned out to hold), and `resume.json` when an
+export has been put down and not yet picked up.
 
 All three writing folders can be moved, from **folders** in the right-hand panel:
 

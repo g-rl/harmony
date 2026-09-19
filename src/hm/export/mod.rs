@@ -1,6 +1,7 @@
 pub mod drag;
 pub mod flac;
 pub mod layout;
+pub mod liblog;
 pub mod manifest;
 pub mod ogg;
 pub mod queue;
@@ -72,6 +73,27 @@ pub fn estimate(entries: &[Entry], format: Format) -> u64 {
         .sum()
 }
 
+/// Is this sound one of the ones being left out of a library run?
+///
+/// Two things are matched, because `voice` means both of them: the bucket
+/// harmony filed the sound under, and the first folder of the sound's own
+/// name. On black ops iii `voice` is a bucket worked out from the name; on the
+/// older titles it is a folder the game itself wrote. Leaving out `voice`
+/// should mean the same thing either way.
+pub fn left_out(skip: &[String], bucket: &str, display: &str) -> bool {
+    if skip.is_empty() {
+        return false;
+    }
+    if skip.iter().any(|name| name == bucket) {
+        return true;
+    }
+    let Some((head, _)) = display.split_once('/') else {
+        return false;
+    };
+    let head = head.to_ascii_lowercase();
+    skip.iter().any(|name| *name == head)
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub format: Format,
@@ -90,5 +112,29 @@ impl Default for Options {
             skip_duplicates: true,
             write_manifest: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `voice` is a bucket on the newer titles and a folder on the older ones.
+    /// Leaving it out has to mean both, and nothing else.
+    #[test]
+    fn what_is_left_out() {
+        let skip = vec!["voice".to_string()];
+        assert!(left_out(&skip, "voice", "_f6a6b431ac13033b"));
+        assert!(left_out(&skip, "misc", "voice/ru/hello.wav"));
+        assert!(!left_out(&skip, "weapons", "sound/voiceover/x.wav"));
+        assert!(!left_out(&[], "voice", "voice/ru/hello.wav"));
+    }
+
+    /// A run measured in hours reads as hours.
+    #[test]
+    fn a_long_run_spells_itself() {
+        assert_eq!(liblog::spell(9.0), "0m 09s");
+        assert_eq!(liblog::spell(125.0), "2m 05s");
+        assert_eq!(liblog::spell(4325.0), "1h 12m 05s");
     }
 }

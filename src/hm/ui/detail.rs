@@ -242,6 +242,55 @@ fn tree(ui: &mut egui::Ui, state: &mut State) {
     ui.add_space(4.0);
 }
 
+/// Buckets a library run leaves on the shelf.
+///
+/// Ticked off rather than searched for: a dump of everything that skips the
+/// voice folder is still a dump, and typing `-category:voice` into the search
+/// box to get one is a thing nobody finds. What is left out here is left out
+/// of `extract library` only — `extract shown` already writes exactly what is
+/// on screen — and it is remembered between runs.
+fn leaving_out(ui: &mut egui::Ui, state: &mut State) {
+    if state.buckets.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    widgets::hairline(ui);
+    ui.add_space(6.0);
+    let gone: usize = state
+        .buckets
+        .iter()
+        .filter(|(name, _)| state.settings.skip.iter().any(|skip| skip == name))
+        .map(|(_, count)| count)
+        .sum();
+    ui.colored_label(
+        theme::DIM,
+        match gone {
+            0 => "leave out of a library run".to_string(),
+            _ => format!("leave out of a library run  ({} skipped)", widgets::tally(gone)),
+        },
+    );
+    ui.add_space(2.0);
+    let buckets = state.buckets.clone();
+    let mut toggled: Option<&str> = None;
+    ui.horizontal_wrapped(|ui| {
+        for (name, count) in &buckets {
+            let off = state.settings.skip.iter().any(|skip| skip == name);
+            if widgets::chip(ui, &format!("{name} {}", widgets::tally(*count)), off)
+                .on_hover_text(match off {
+                    true => format!("{name} is left out"),
+                    false => format!("leave {name} out"),
+                })
+                .clicked()
+            {
+                toggled = Some(name);
+            }
+        }
+    });
+    if let Some(name) = toggled {
+        state.toggle_left_out(name);
+    }
+}
+
 fn output(ui: &mut egui::Ui, state: &mut State) {
     ui.colored_label(theme::DIM, "output");
     ui.add_space(4.0);
@@ -286,6 +335,8 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
         ui.colored_label(theme::DIM, crate::hm::discord::clip(&shown, 30));
     });
 
+    leaving_out(ui, state);
+
     folders(ui, state);
 
     presets(ui, state);
@@ -307,7 +358,15 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
     // The whole library, filter or no filter, into a folder named after the
     // game and the build it came out of.
     if !state.catalog.is_empty() {
-        let count = widgets::tally(state.catalog.len());
+        // What the button says is what the run will actually write, which is
+        // the catalogue less whatever is being left out.
+        let gone: usize = state
+            .buckets
+            .iter()
+            .filter(|(name, _)| state.settings.skip.iter().any(|skip| skip == name))
+            .map(|(_, count)| count)
+            .sum();
+        let count = widgets::tally(state.catalog.len().saturating_sub(gone));
         if ui
             .button(format!("extract library ({count})"))
             .on_hover_text(format!(
@@ -318,6 +377,36 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
         {
             state.extract_library();
         }
+    }
+
+    // An export that was put down, here or in an earlier run of harmony. It
+    // only shows on the game it belongs to, and picking it up steps over every
+    // file that is already written.
+    if let Some(resume) = state.resume.clone()
+        && state.title.map(|id| id.key()) == Some(resume.game.as_str())
+    {
+        ui.add_space(4.0);
+        ui.colored_label(
+            theme::DIM,
+            format!(
+                "put down {}: {} of {} written",
+                resume.at,
+                widgets::tally(resume.done),
+                widgets::tally(resume.total)
+            ),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .button("resume export")
+                .on_hover_text(format!("carry on into {}", resume.folder))
+                .clicked()
+            {
+                state.resume_export();
+            }
+            if ui.button("forget it").clicked() {
+                state.forget_resume();
+            }
+        });
     }
 
     let mut discord = state.settings.discord;

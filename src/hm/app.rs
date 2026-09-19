@@ -117,6 +117,19 @@ pub struct State {
     pub status: String,
     pub error: Option<String>,
     pub show_queue: bool,
+    /// The window was asked to close while something was still running.
+    pub closing: bool,
+    /// The question has been answered and harmony is on its way out.
+    pub quitting: bool,
+    /// An export that was put down, here or in an earlier run of harmony.
+    pub resume: Option<storage::Resume>,
+    /// This run is picking one of those up.
+    pub resuming: bool,
+    /// The folder the run now going is writing into, under the export folder.
+    pub library_at: Option<String>,
+    /// What each bucket of this catalogue holds, counted when the catalogue
+    /// changes: the list the export panel ticks off.
+    pub buckets: Vec<(&'static str, usize)>,
     /// When the export now running began, so discord counts the run rather
     /// than the session.
     pub export_since: Option<i64>,
@@ -192,7 +205,7 @@ pub struct Looking {
 /// Reading a cache back is fifty megabytes of json and opening an install is
 /// two hundred containers; doing both again because a tab was clicked twice is
 /// the pause this avoids. Only the last few are kept, and only what was
-/// already in hand — nothing is read to fill this.
+/// already in hand â nothing is read to fill this.
 pub struct Shelved {
     pub title: TitleId,
     /// The folder it was read out of. A game pointed somewhere else is a
@@ -281,6 +294,20 @@ pub enum Again {
     /// The whole library, into a folder of its own.
     Library,
     DragOut,
+}
+
+/// What harmony is still in the middle of when the window is asked to close.
+pub struct Busy {
+    /// How far along an export is, when one is running.
+    pub exporting: Option<(usize, usize)>,
+    pub scanning: bool,
+    pub naming: bool,
+}
+
+impl Busy {
+    pub fn anything(&self) -> bool {
+        self.exporting.is_some() || self.scanning || self.naming
+    }
 }
 
 /// What an export says for itself on discord while it runs.
@@ -397,6 +424,12 @@ impl State {
             status: "pick a game folder".into(),
             error: None,
             show_queue: false,
+            closing: false,
+            quitting: false,
+            resume: storage::load_resume(),
+            resuming: false,
+            library_at: None,
+            buckets: Vec::new(),
             export_since: None,
             presence_at: 0,
             was_exporting: false,
@@ -702,7 +735,7 @@ impl State {
     /// What a tab does when it is clicked.
     ///
     /// The game is either in the folder that is open, or in one harmony has
-    /// been shown before, or nowhere yet — and in that last case the click is
+    /// been shown before, or nowhere yet â and in that last case the click is
     /// the ask for it, rather than a button that does nothing.
     pub fn switch(&mut self, id: TitleId) {
         if self.title == Some(id) {
@@ -1336,9 +1369,9 @@ impl State {
             };
             let sound_count = match counted {
                 0 => String::new(),
-                found => format!(" Â· {} sounds", ui::widgets::tally(found)),
+                found => format!(" ÃÂ· {} sounds", ui::widgets::tally(found)),
             };
-            parts.push(format!("{heading} Â· {what}{sound_count}"));
+            parts.push(format!("{heading} ÃÂ· {what}{sound_count}"));
         }
 
         if self.jobs.iter().any(|job| job.kind == scan::Kind::Mount) {
@@ -1366,7 +1399,7 @@ impl State {
             parts.push(match total {
                 0 => format!("reading the cached scan of {}", loading.title.abbr()),
                 total => format!(
-                    "loading {} Â· {} of {}",
+                    "loading {} ÃÂ· {} of {}",
                     loading.title.abbr(),
                     ui::widgets::tally(loading.at),
                     ui::widgets::tally(total)
@@ -1439,6 +1472,7 @@ impl State {
         self.pump_naming();
         self.pump_sounding();
         self.pump_presence();
+        self.pump_resume();
         self.read_disks();
 
         // The veil comes down once there is nothing left to wait for.
@@ -1638,8 +1672,51 @@ impl State {
         }
     }
 
+    /// Is this sound one of the ones being left out of a library run?
+    ///
+    /// Two things are matched, because `voice` means both of them: the bucket
+    /// harmony filed the sound under, and the first folder of the sound's own
+    /// name. On black ops iii `voice` is a category worked out from the name;
+    /// on the older titles it is a folder the game itself wrote. Leaving out
+    /// `voice` should mean the same thing either way.
+    pub fn left_out(&self, entry: &Entry) -> bool {
+        crate::hm::export::left_out(
+            &self.settings.skip,
+            entry.category.label(),
+            &entry.display(),
+        )
+    }
+
+    /// Stop leaving this bucket out, or start.
+    pub fn toggle_left_out(&mut self, name: &str) {
+        match self.settings.skip.iter().position(|other| other == name) {
+            Some(at) => {
+                self.settings.skip.remove(at);
+            }
+            None => self.settings.skip.push(name.to_string()),
+        }
+        storage::save(&self.settings);
+    }
+
+    /// What buckets this catalogue holds and how many are in each, worked out
+    /// when the catalogue changes rather than every frame: at a hundred and
+    /// twenty thousand entries this is not a thing to count while drawing.
+    fn count_buckets(&mut self) {
+        let mut counts: Vec<(&'static str, usize)> = Vec::new();
+        for entry in &self.catalog.entries {
+            let label = entry.category.label();
+            match counts.iter_mut().find(|(name, _)| *name == label) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((label, 1)),
+            }
+        }
+        counts.sort_by(|a, b| a.0.cmp(b.0));
+        self.buckets = counts;
+    }
+
     pub fn refilter(&mut self) {
         self.dirty = false;
+        self.count_buckets();
         self.filtered_at = std::time::Instant::now();
         self.query = parse::parse(&self.query_text);
         let game = self
@@ -2157,6 +2234,10 @@ impl State {
             .unwrap_or_else(|| "unknown".into());
         self.show_queue = true;
         self.export_since = Some(crate::hm::discord::now_ms());
+        // A run of the selection is not a library run, and must not be taken
+        // for one when the window is closed on it.
+        self.library_at = None;
+        self.resuming = false;
         self.queue.start(
             mount,
             chosen,
@@ -2164,6 +2245,7 @@ impl State {
             game,
             root,
             self.options.clone(),
+            None,
         );
     }
 
@@ -2187,14 +2269,163 @@ impl State {
         crate::hm::export::layout::safe(&stem)
     }
 
+    /// What is still going on, said plainly, or nothing when harmony is idle.
+    ///
+    /// This is what the window asks about before it closes. A scan and an
+    /// export are not the same kind of loss: a scan writes its own cache and
+    /// can simply be run again, an export is hours of writing that should be
+    /// picked up rather than started over.
+    pub fn busy(&self) -> Busy {
+        let (running, done, failed, total) = self
+            .queue
+            .progress
+            .lock()
+            .map(|p| (p.running, p.done, p.failed, p.total))
+            .unwrap_or((false, 0, 0, 0));
+        Busy {
+            exporting: running.then_some((done + failed, total)),
+            scanning: !self.jobs.is_empty() || self.loading.is_some(),
+            naming: self.naming.is_some(),
+        }
+    }
+
+    /// The close button, and the one the window manager sends.
+    ///
+    /// Nothing running, nothing to ask: it closes. Something running, and the
+    /// question is put once, with the export given a way out that does not
+    /// throw away what it has already written.
+    pub fn ask_close(&mut self, ctx: &egui::Context) {
+        if self.quitting || !self.busy().anything() {
+            self.quitting = true;
+            crate::hm::window::chrome::close(ctx);
+            return;
+        }
+        self.closing = true;
+    }
+
+    /// Stop the export where it is and write down what it was, so it can be
+    /// picked up later.
+    ///
+    /// What is not written down is which sounds got written: the folder on
+    /// disk says that, and `skip existing` steps over every one of them when
+    /// the run comes back. That is slower than a list would be by one stat per
+    /// file, and it cannot go wrong, which a list can.
+    pub fn pause_and_save(&mut self) {
+        // Only a library run can be picked up: it writes into a folder of its
+        // own, which is what tells a resumed run what is already there. A
+        // handful of sounds sent to the queue by hand is not worth the
+        // bookkeeping and would point at the wrong folder if it were.
+        let Some(folder) = self.library_at.clone() else {
+            self.queue.stop();
+            return;
+        };
+        let (done, failed, total) = self
+            .queue
+            .progress
+            .lock()
+            .map(|p| (p.done, p.failed, p.total))
+            .unwrap_or((0, 0, 0));
+        let Some(into) = self.output.clone() else {
+            return;
+        };
+        let resume = storage::Resume {
+            game: self.title.map(|id| id.key().to_string()).unwrap_or_default(),
+            label: self.title.map(title_label).unwrap_or("unknown").to_string(),
+            root: self.root.clone().unwrap_or_default(),
+            into,
+            folder,
+            format: self.options.format.label().to_string(),
+            layout: self.options.layout.label().to_string(),
+            normalise_names: self.options.normalise_names,
+            write_manifest: self.options.write_manifest,
+            skip: self.settings.skip.clone(),
+            done,
+            failed,
+            total,
+            at: storage::stamp(),
+        };
+        storage::save_resume(&resume);
+        self.resume = Some(resume);
+        self.queue.stop();
+        self.status = "export put down; it can be picked up from the same folder".into();
+    }
+
+    /// Pick up the export that was put down.
+    ///
+    /// The same run, into the same folder, with `skip existing` on: everything
+    /// already written is stepped over, and what is left carries on.
+    pub fn resume_export(&mut self) {
+        let Some(resume) = self.resume.clone() else {
+            return;
+        };
+        if self.title.map(|id| id.key()) != Some(resume.game.as_str()) {
+            self.error = Some(format!("that export was of {}", resume.label));
+            return;
+        }
+        self.output = Some(resume.into.clone());
+        self.settings.output = Some(resume.into.clone());
+        self.settings.format = resume.format.clone();
+        self.settings.layout = resume.layout.clone();
+        self.settings.skip = resume.skip.clone();
+        self.options.format = self.settings.format();
+        self.options.layout = self.settings.layout();
+        self.options.normalise_names = resume.normalise_names;
+        self.options.write_manifest = resume.write_manifest;
+        // The one option a resumed run does not take from the user: without it
+        // the run would write every file it already wrote a second time.
+        self.options.skip_duplicates = true;
+        storage::save(&self.settings);
+        self.run_library(Some(resume.folder.clone()), true);
+    }
+
+    /// Forget an export that was put down, without running it.
+    pub fn forget_resume(&mut self) {
+        storage::clear_resume();
+        self.resume = None;
+        self.status = "put-down export forgotten".into();
+    }
+
+    /// A resumed run that reached the end clears what it was resuming from.
+    fn pump_resume(&mut self) {
+        if !self.resuming {
+            return;
+        }
+        let (running, done, failed, total) = self
+            .queue
+            .progress
+            .lock()
+            .map(|p| (p.running, p.done, p.failed, p.total))
+            .unwrap_or((false, 0, 0, 0));
+        if running || total == 0 {
+            return;
+        }
+        self.resuming = false;
+        if done + failed >= total {
+            storage::clear_resume();
+            self.resume = None;
+            self.status = format!("export finished: {done} written, {failed} failed");
+        }
+    }
+
     /// Extract everything this game has, filter or no filter.
     ///
     /// Not the same button as `extract shown` with nothing typed in the search
     /// box: this one ignores the view entirely, makes a folder of its own named
-    /// after the game and the build it came from, and runs wide — every worker
-    /// the machine can spare — because a library is a hundred thousand sounds
-    /// and an afternoon, not a handful.
+    /// after the game and the build it came from, leaves out whatever buckets
+    /// were ticked off, and runs wide â every worker the machine can spare â
+    /// because a library is a hundred thousand sounds and an afternoon, not a
+    /// handful.
     pub fn extract_library(&mut self) {
+        self.run_library(None, false);
+    }
+
+    /// The library run itself.
+    ///
+    /// `folder` is the name under the export folder, which a resumed run
+    /// carries over from the run it is picking up rather than working out
+    /// again — a game patched in the meantime would otherwise be written
+    /// somewhere else and half the work would be done twice.
+    fn run_library(&mut self, folder: Option<String>, resuming: bool) {
         let Some(mount) = self.mount.clone() else {
             self.error = Some("nothing mounted".into());
             return;
@@ -2216,9 +2447,29 @@ impl State {
             },
         };
         let build = mount.lock().ok().and_then(|lock| lock.build.clone());
-        let root = into.join(self.library_folder(build.as_deref()));
+        let folder = folder.unwrap_or_else(|| self.library_folder(build.as_deref()));
+        let root = into.join(&folder);
 
-        let chosen: Vec<Entry> = self.catalog.entries.clone();
+        // What is being left out, counted as it is dropped, so the log can say
+        // how much was skipped rather than only that something was.
+        let mut left: Vec<(&'static str, usize)> = Vec::new();
+        let mut chosen: Vec<Entry> = Vec::with_capacity(self.catalog.len());
+        for entry in &self.catalog.entries {
+            if self.left_out(entry) {
+                let label = entry.category.label();
+                match left.iter_mut().find(|(name, _)| *name == label) {
+                    Some((_, count)) => *count += 1,
+                    None => left.push((label, 1)),
+                }
+                continue;
+            }
+            chosen.push(entry.clone());
+        }
+        if chosen.is_empty() {
+            self.error = Some("everything is left out".into());
+            return;
+        }
+
         let want = crate::hm::export::estimate(&chosen, self.options.format);
         if let Some(room) = space::shortfall(&into, want) {
             self.blocked = Some(Blocked {
@@ -2238,12 +2489,55 @@ impl State {
             .title
             .map(|t| t.key().to_string())
             .unwrap_or_else(|| "unknown".into());
+
+        // The head of the log, written before a single sound is: what was
+        // asked for, out of what, into where.
+        let mut log = crate::hm::export::liblog::Log::new(&root);
+        log.say(format!("harmony library extract  Â·  {}", storage::stamp()));
+        log.blank();
+        log.say(format!("game      {} ({game})", self.title.map(title_label).unwrap_or("unknown")));
+        log.say(format!("build     {}", build.as_deref().unwrap_or("unknown")));
+        log.say(format!(
+            "from      {}",
+            self.root
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_else(|| "unknown".into())
+        ));
+        log.say(format!("into      {}", root.to_string_lossy().to_ascii_lowercase()));
+        log.say(format!("format    {}", self.options.format.label()));
+        log.say(format!("tree      {}", self.options.layout.label()));
+        log.say(format!("threads   {}", crate::hm::export::queue::Queue::workers()));
+        log.say(format!("sounds    {} of {}", chosen.len(), self.catalog.len()));
+        if resuming {
+            log.say(format!(
+                "resuming  picked up from {}, files already there are stepped over",
+                self.resume
+                    .as_ref()
+                    .map(|r| r.at.as_str())
+                    .unwrap_or("an earlier run")
+            ));
+        }
+        if !left.is_empty() {
+            left.sort_by(|a, b| b.1.cmp(&a.1));
+            let gone: usize = left.iter().map(|(_, count)| count).sum();
+            log.say(format!(
+                "left out  {gone}  ({})",
+                left.iter()
+                    .map(|(name, count)| format!("{name} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        log.blank();
+
         self.show_queue = true;
         self.export_since = Some(crate::hm::discord::now_ms());
+        self.resuming = resuming;
+        self.library_at = Some(folder.clone());
         self.status = format!(
-            "extracting {} sounds into {}",
-            ui::widgets::tally(chosen.len()),
-            self.library_folder(build.as_deref())
+            "extracting {} sounds into {folder}",
+            ui::widgets::tally(chosen.len())
         );
         self.queue.start(
             mount,
@@ -2252,6 +2546,7 @@ impl State {
             game,
             root,
             self.options.clone(),
+            Some(log),
         );
     }
 
@@ -2554,6 +2849,15 @@ impl eframe::App for Harmony {
         // Before anything else: the card went up last frame and is on screen, so
         // this hands the thread to ole until the pointer comes up.
         self.state.finish_drag_out();
+        // Alt-F4, the taskbar, the shell asking politely: all of them arrive
+        // here, and all of them get the same question as the close button.
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.state.quitting
+            && self.state.busy().anything()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.state.closing = true;
+        }
         self.state.pump();
         // Filtering and regrouping happen here, once, rather than every time a
         // batch of a running scan lands.
@@ -2598,6 +2902,7 @@ impl eframe::App for Harmony {
 
         if self.state.show_queue {
             ui::queue::window(&ctx, &mut self.state);
+            ui::closing::window(&ctx, &mut self.state);
         }
 
         // Anything stopped for want of disk room says so over everything else.

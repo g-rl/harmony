@@ -252,7 +252,9 @@ fn title_bar(ui: &mut egui::Ui, state: &mut State) {
                 |ui| {
                     let close = widgets::tiny(ui, "\u{00d7}").on_hover_text("close");
                     if close.clicked() {
-                        chrome::close(&ctx);
+                        // Not straight out: anything still running gets to be
+                        // asked about first.
+                        state.ask_close(&ctx);
                     }
                     let fill = widgets::tiny(ui, "\u{25a1}").on_hover_text(
                         if chrome::maximized(&ctx) {

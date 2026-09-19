@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::hm::catalog::{Entry, Source};
-use crate::hm::export::{Format, Options, flac, layout, manifest, ogg, wav};
+use crate::hm::export::{Format, Options, flac, layout, liblog, manifest, ogg, wav};
 use crate::hm::game::Mount;
 use crate::hm::sound::{decode, opus};
 use crate::hm::storage::space;
@@ -41,6 +41,9 @@ pub const RECENT: usize = 6;
 /// rises; the reasons stop being collected, because they repeat.
 pub const FAILURES: usize = 200;
 
+/// How often a running log is rewritten.
+const CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[derive(Default)]
 pub struct Progress {
     pub jobs: Vec<Job>,
@@ -62,6 +65,8 @@ pub struct Progress {
     pub bytes: u64,
     /// How many threads are writing.
     pub workers: usize,
+    /// Where the log of this run is being kept, for the runs that keep one.
+    pub logged: Option<PathBuf>,
     /// Set when the queue stopped itself because the disk it is writing to
     /// ran out of room. The work is paused, not abandoned: clearing this and
     /// unpausing carries on from the file it stopped at.
@@ -106,10 +111,10 @@ impl Queue {
     ///
     /// Reading a blob out of a container takes the mount's lock, so the reads
     /// happen one after another whatever this says; decoding and encoding do
-    /// not, and on a flac or an mp3 run that is nearly all of the work. Two
-    /// fewer than the machine has, so the window and the player still get a
-    /// core while a hundred thousand sounds are being written.
-    fn workers() -> usize {
+    /// not, and on a flac run that is nearly all of the work. Two fewer than
+    /// the machine has, so the window and the player still get a core while a
+    /// hundred thousand sounds are being written.
+    pub fn workers() -> usize {
         std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2).clamp(1, 8))
             .unwrap_or(2)
@@ -123,6 +128,7 @@ impl Queue {
         game: String,
         root: PathBuf,
         options: Options,
+        log: Option<liblog::Log>,
     ) {
         let total = entries.len();
         let bulk = total > LISTED;
@@ -153,6 +159,7 @@ impl Queue {
             progress.failures.clear();
             progress.bytes = 0;
             progress.workers = workers;
+            progress.logged = log.as_ref().map(|log| log.path().to_path_buf());
         }
         self.cancel.store(false, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
@@ -170,6 +177,15 @@ impl Queue {
             let root = Arc::new(root);
             let next = Arc::new(AtomicUsize::new(0));
             let rows = Arc::new(Mutex::new(Vec::<manifest::Row>::new()));
+            // Every failure, not the capped handful the window shows: a log is
+            // read afterwards, when the whole list is the point.
+            let fails = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+            let began = Instant::now();
+
+            let mut log = log;
+            if let Some(log) = log.as_mut() {
+                log.flush();
+            }
 
             let mut hands = Vec::with_capacity(workers);
             for _ in 0..workers {
@@ -179,6 +195,7 @@ impl Queue {
                 let root = root.clone();
                 let next = next.clone();
                 let rows = rows.clone();
+                let fails = fails.clone();
                 let progress = progress.clone();
                 let cancel = cancel.clone();
                 let paused = paused.clone();
@@ -186,6 +203,7 @@ impl Queue {
                 let game = game.clone();
                 hands.push(std::thread::spawn(move || {
                     let mut mine: Vec<manifest::Row> = Vec::new();
+                    let mut mine_failed: Vec<(String, String)> = Vec::new();
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(entry) = entries.get(index) else {
@@ -277,16 +295,47 @@ impl Queue {
                                 }
                                 lock.failed += 1;
                                 if lock.failures.len() < FAILURES {
-                                    lock.failures.push((entry.display(), error));
+                                    lock.failures.push((entry.display(), error.clone()));
                                 }
+                                mine_failed.push((entry.display(), error));
                             }
                         }
                     }
                     if !mine.is_empty() {
                         rows.lock().unwrap().extend(mine);
                     }
+                    if !mine_failed.is_empty() {
+                        fails.lock().unwrap().extend(mine_failed);
+                    }
                 }));
             }
+
+            // While the pool runs, the log is rewritten every so often, so a
+            // run that is killed outright still leaves something readable.
+            if log.is_some() {
+                let mut wrote = Instant::now();
+                while !hands.iter().all(|hand| hand.is_finished()) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if wrote.elapsed() < CHECKPOINT {
+                        continue;
+                    }
+                    wrote = Instant::now();
+                    let (done, failed) = {
+                        let lock = progress.lock().unwrap();
+                        (lock.done, lock.failed)
+                    };
+                    if let Some(log) = log.as_mut() {
+                        let mut so_far = log.clone();
+                        so_far.say(format!(
+                            "still running: {done} written, {failed} failed, {} in after {}",
+                            total,
+                            liblog::spell(began.elapsed().as_secs_f32())
+                        ));
+                        so_far.flush();
+                    }
+                }
+            }
+
             for hand in hands {
                 let _ = hand.join();
             }
@@ -297,6 +346,34 @@ impl Queue {
                     let _ = manifest::write(&root.join("manifest.json"), &rows);
                 }
             }
+
+            let (done, failed) = {
+                let lock = progress.lock().unwrap();
+                (lock.done, lock.failed)
+            };
+            if let Some(log) = log.as_mut() {
+                let stopped = cancel.load(Ordering::Relaxed);
+                log.blank();
+                log.say(match stopped {
+                    true => "cancelled",
+                    false => "finished",
+                });
+                log.say(format!("written   {done}"));
+                log.say(format!("failed    {failed}"));
+                log.say(format!("asked for {total}"));
+                log.say(format!("took      {}", liblog::spell(began.elapsed().as_secs_f32())));
+                log.say(format!("ended     {}", stamp()));
+                let fails = fails.lock().unwrap();
+                if !fails.is_empty() {
+                    log.blank();
+                    log.say(format!("what failed ({})", fails.len()));
+                    for (name, why) in fails.iter() {
+                        log.say(format!("  {name}  {why}"));
+                    }
+                }
+                log.flush();
+            }
+
             let mut lock = progress.lock().unwrap();
             lock.running = false;
         });

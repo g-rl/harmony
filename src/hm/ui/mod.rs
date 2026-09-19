@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod closing;
 pub mod detail;
 pub mod dragout;
 pub mod games;
