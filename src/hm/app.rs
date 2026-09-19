@@ -121,12 +121,16 @@ pub struct State {
     pub closing: bool,
     /// The question has been answered and harmony is on its way out.
     pub quitting: bool,
-    /// An export that was put down, here or in an earlier run of harmony.
-    pub resume: Option<storage::Resume>,
+    /// Exports that were put down, here or in an earlier run of harmony:
+    /// one note each, newest first.
+    pub resumes: Vec<storage::Resume>,
     /// This run is picking one of those up.
     pub resuming: bool,
-    /// The folder the run now going is writing into, under the export folder.
-    pub library_at: Option<String>,
+    /// A look at the remembered paths, running on a worker.
+    watching: Option<std::sync::mpsc::Receiver<storage::watch::Missing>>,
+    /// When the last look came back, so the next one is not asked for until
+    /// it is worth asking.
+    watched_at: std::time::Instant,
     /// What each bucket of this catalogue holds, counted when the catalogue
     /// changes: the list the export panel ticks off.
     pub buckets: Vec<(&'static str, usize)>,
@@ -300,13 +304,15 @@ pub enum Again {
 pub struct Busy {
     /// How far along an export is, when one is running.
     pub exporting: Option<(usize, usize)>,
+    /// Runs behind it that have not started.
+    pub queued: usize,
     pub scanning: bool,
     pub naming: bool,
 }
 
 impl Busy {
     pub fn anything(&self) -> bool {
-        self.exporting.is_some() || self.scanning || self.naming
+        self.exporting.is_some() || self.queued > 0 || self.scanning || self.naming
     }
 }
 
@@ -426,9 +432,10 @@ impl State {
             show_queue: false,
             closing: false,
             quitting: false,
-            resume: storage::load_resume(),
+            resumes: storage::load_resumes(),
             resuming: false,
-            library_at: None,
+            watching: None,
+            watched_at: std::time::Instant::now(),
             buckets: Vec::new(),
             export_since: None,
             presence_at: 0,
@@ -1369,9 +1376,9 @@ impl State {
             };
             let sound_count = match counted {
                 0 => String::new(),
-                found => format!(" ÃÂ· {} sounds", ui::widgets::tally(found)),
+                found => format!(" \u{b7} {} sounds", ui::widgets::tally(found)),
             };
-            parts.push(format!("{heading} ÃÂ· {what}{sound_count}"));
+            parts.push(format!("{heading} \u{b7} {what}{sound_count}"));
         }
 
         if self.jobs.iter().any(|job| job.kind == scan::Kind::Mount) {
@@ -1399,7 +1406,7 @@ impl State {
             parts.push(match total {
                 0 => format!("reading the cached scan of {}", loading.title.abbr()),
                 total => format!(
-                    "loading {} ÃÂ· {} of {}",
+                    "loading {} \u{b7} {} of {}",
                     loading.title.abbr(),
                     ui::widgets::tally(loading.at),
                     ui::widgets::tally(total)
@@ -1473,6 +1480,7 @@ impl State {
         self.pump_sounding();
         self.pump_presence();
         self.pump_resume();
+        self.pump_watch();
         self.read_disks();
 
         // The veil comes down once there is nothing left to wait for.
@@ -2234,19 +2242,29 @@ impl State {
             .unwrap_or_else(|| "unknown".into());
         self.show_queue = true;
         self.export_since = Some(crate::hm::discord::now_ms());
-        // A run of the selection is not a library run, and must not be taken
-        // for one when the window is closed on it.
-        self.library_at = None;
         self.resuming = false;
-        self.queue.start(
+        let label = format!(
+            "{} \u{b7} {} sounds",
+            self.title.map(|id| id.abbr()).unwrap_or("unknown"),
+            ui::widgets::tally(chosen.len())
+        );
+        let now = self.queue.submit(crate::hm::export::queue::Run {
+            id: crate::hm::export::queue::next_id(),
+            label: label.clone(),
             mount,
-            chosen,
-            self.mounted.packages.clone(),
+            entries: chosen,
+            packages: self.mounted.packages.clone(),
             game,
             root,
-            self.options.clone(),
-            None,
-        );
+            options: self.options.clone(),
+            log: None,
+            // A run of the selection owns no folder of its own, so there is
+            // nothing to pick it up from: it is small enough to run again.
+            resume: None,
+        });
+        if !now {
+            self.status = format!("{label} queued behind the export already running");
+        }
     }
 
     /// What a whole library is written into: `[t7] black ops iii - 1.0.0.2`.
@@ -2269,6 +2287,126 @@ impl State {
         crate::hm::export::layout::safe(&stem)
     }
 
+    /// Look over the paths harmony remembers, off the draw thread.
+    ///
+    /// Every remembered folder is a guess about the world: a game gets
+    /// uninstalled, a drive gets unplugged, an export folder gets tidied away.
+    /// A `stat` of a dozen paths is quick but it is still disk, and a drive
+    /// that has gone away can take seconds to say so, which is a frozen window
+    /// if it is asked for on the thread that draws. So it is asked on a worker,
+    /// every few seconds, and what comes back is applied quietly.
+    fn pump_watch(&mut self) {
+        const GAP: std::time::Duration = std::time::Duration::from_secs(8);
+
+        if let Some(rx) = self.watching.as_ref() {
+            match rx.try_recv() {
+                Ok(missing) => {
+                    self.watching = None;
+                    self.watched_at = std::time::Instant::now();
+                    self.forget_missing(missing);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.watching = None,
+            }
+            return;
+        }
+        if self.watched_at.elapsed() < GAP {
+            return;
+        }
+        // A folder being written into right now is not checked: an export or a
+        // scan is already reading and writing it, and would say so itself.
+        if self.busy().anything() {
+            self.watched_at = std::time::Instant::now();
+            return;
+        }
+        let ask = storage::watch::Ask {
+            roots: self
+                .settings
+                .roots
+                .iter()
+                .map(|(key, path)| (key.clone(), path.clone()))
+                .collect(),
+            output: self.output.clone(),
+            cache_dir: self.settings.cache_dir.clone(),
+            temp_dir: self.settings.temp_dir.clone(),
+            last_root: self.settings.last_root.clone(),
+            name_files: self.settings.name_files.clone(),
+            resumes: self
+                .resumes
+                .iter()
+                .map(|resume| (resume.file_name(), resume.into.join(&resume.folder)))
+                .collect(),
+            open: self.root.clone(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(storage::watch::look(&ask));
+        });
+        self.watching = Some(rx);
+    }
+
+    /// Put down what is no longer there.
+    ///
+    /// Silently: a path that has gone is not an error the user has to dismiss,
+    /// it is the world having moved on. A tab whose folder is gone goes back to
+    /// being a tab with no folder, which is exactly what it looked like before
+    /// the folder was ever picked.
+    fn forget_missing(&mut self, missing: storage::watch::Missing) {
+        if !missing.anything() {
+            return;
+        }
+        for key in &missing.roots {
+            self.settings.roots.remove(key);
+        }
+        if missing.output {
+            self.output = None;
+            self.settings.output = None;
+        }
+        // The cache and scratch folders always have somewhere to fall back to:
+        // beside the settings, which harmony can make itself.
+        if missing.cache_dir {
+            self.settings.cache_dir = None;
+        }
+        if missing.temp_dir {
+            self.settings.temp_dir = None;
+        }
+        if missing.cache_dir || missing.temp_dir {
+            storage::use_folders(&self.settings);
+        }
+        if missing.last_root {
+            self.settings.last_root = None;
+        }
+        if !missing.name_files.is_empty() {
+            self.settings
+                .name_files
+                .retain(|path| !missing.name_files.contains(path));
+        }
+        // An export cannot be picked up from a folder that is not there any
+        // more, and offering to would only fail later.
+        for name in &missing.resumes {
+            if let Some(at) = self
+                .resumes
+                .iter()
+                .position(|resume| resume.file_name() == *name)
+            {
+                let resume = self.resumes.remove(at);
+                storage::clear_resume(&resume);
+            }
+        }
+        // The install on screen is gone: everything read out of it goes with
+        // it, and the tab is where it was before the folder was picked. The
+        // catalogue is dropped rather than kept, because every sound in it
+        // points at a file that is no longer there.
+        if missing.open {
+            self.forget_open();
+            self.root = None;
+            self.detected.clear();
+            self.shelf.clear();
+            self.dirty = true;
+        }
+        storage::save(&self.settings);
+    }
+
     /// What is still going on, said plainly, or nothing when harmony is idle.
     ///
     /// This is what the window asks about before it closes. A scan and an
@@ -2276,14 +2414,15 @@ impl State {
     /// can simply be run again, an export is hours of writing that should be
     /// picked up rather than started over.
     pub fn busy(&self) -> Busy {
-        let (running, done, failed, total) = self
+        let (running, done, failed, total, queued) = self
             .queue
             .progress
             .lock()
-            .map(|p| (p.running, p.done, p.failed, p.total))
-            .unwrap_or((false, 0, 0, 0));
+            .map(|p| (p.running, p.done, p.failed, p.total, p.waiting.len()))
+            .unwrap_or((false, 0, 0, 0, 0));
         Busy {
             exporting: running.then_some((done + failed, total)),
+            queued,
             scanning: !self.jobs.is_empty() || self.loading.is_some(),
             naming: self.naming.is_some(),
         }
@@ -2294,6 +2433,15 @@ impl State {
     /// Nothing running, nothing to ask: it closes. Something running, and the
     /// question is put once, with the export given a way out that does not
     /// throw away what it has already written.
+    /// Can the run that is going be put down and picked up later?
+    pub fn resumable(&self) -> bool {
+        self.queue
+            .progress
+            .lock()
+            .map(|lock| lock.resume.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn ask_close(&mut self, ctx: &egui::Context) {
         if self.quitting || !self.busy().anything() {
             self.quitting = true;
@@ -2303,59 +2451,79 @@ impl State {
         self.closing = true;
     }
 
-    /// Stop the export where it is and write down what it was, so it can be
-    /// picked up later.
+    /// Stop the line where it is and write every run in it down, so nothing
+    /// is lost by closing the window.
     ///
-    /// What is not written down is which sounds got written: the folder on
-    /// disk says that, and `skip existing` steps over every one of them when
-    /// the run comes back. That is slower than a list would be by one stat per
-    /// file, and it cannot go wrong, which a list can.
+    /// One file per run, not one for the lot: a run is picked up on its own,
+    /// and the one that is going has got somewhere while the ones behind it
+    /// have not. What is not written down is which sounds got written — the
+    /// folder on disk is that list, and `skip existing` steps over every one
+    /// of them when the run comes back.
     pub fn pause_and_save(&mut self) {
-        // Only a library run can be picked up: it writes into a folder of its
-        // own, which is what tells a resumed run what is already there. A
-        // handful of sounds sent to the queue by hand is not worth the
-        // bookkeeping and would point at the wrong folder if it were.
-        let Some(folder) = self.library_at.clone() else {
-            self.queue.stop();
+        let (note, done, failed, total) = {
+            let Ok(lock) = self.queue.progress.lock() else {
+                return;
+            };
+            (lock.resume.clone(), lock.done, lock.failed, lock.total)
+        };
+        let mut put_down: Vec<storage::Resume> = Vec::new();
+
+        // The run that is going, with how far it actually got. A run of the
+        // selection has no note of its own — it owns no folder, so there is
+        // nothing to pick it up from — and is simply stopped.
+        if let Some(resume) = note {
+            let resume = storage::Resume {
+                done,
+                failed,
+                total,
+                at: storage::stamp(),
+                ..resume
+            };
+            storage::save_resume(&resume);
+            put_down.push(resume);
+        }
+        // And everything still waiting, which has got nowhere yet.
+        for resume in self.queue.notes() {
+            let resume = storage::Resume {
+                at: storage::stamp(),
+                ..resume
+            };
+            storage::save_resume(&resume);
+            put_down.push(resume);
+        }
+
+        self.queue.stop_all();
+        if put_down.is_empty() {
             return;
-        };
-        let (done, failed, total) = self
-            .queue
-            .progress
-            .lock()
-            .map(|p| (p.done, p.failed, p.total))
-            .unwrap_or((0, 0, 0));
-        let Some(into) = self.output.clone() else {
-            return;
-        };
-        let resume = storage::Resume {
-            game: self.title.map(|id| id.key().to_string()).unwrap_or_default(),
-            label: self.title.map(title_label).unwrap_or("unknown").to_string(),
-            root: self.root.clone().unwrap_or_default(),
-            into,
-            folder,
-            format: self.options.format.label().to_string(),
-            layout: self.options.layout.label().to_string(),
-            normalise_names: self.options.normalise_names,
-            write_manifest: self.options.write_manifest,
-            skip: self.settings.skip.clone(),
-            done,
-            failed,
-            total,
-            at: storage::stamp(),
-        };
-        storage::save_resume(&resume);
-        self.resume = Some(resume);
-        self.queue.stop();
-        self.status = "export put down; it can be picked up from the same folder".into();
+        }
+        for resume in put_down {
+            self.remember_resume(resume);
+        }
+        self.status = format!(
+            "{} put down; they can be picked up from the same folders",
+            ui::widgets::tally(self.resumes.len())
+        );
     }
 
-    /// Pick up the export that was put down.
+    /// Keep one put-down run in hand, replacing an older note for the same
+    /// folder rather than piling a second one on top of it.
+    fn remember_resume(&mut self, resume: storage::Resume) {
+        self.resumes
+            .retain(|other| other.file_name() != resume.file_name());
+        self.resumes.insert(0, resume);
+    }
+
+    /// Pick up an export that was put down.
     ///
     /// The same run, into the same folder, with `skip existing` on: everything
     /// already written is stepped over, and what is left carries on.
-    pub fn resume_export(&mut self) {
-        let Some(resume) = self.resume.clone() else {
+    pub fn resume_export(&mut self, which: String) {
+        let Some(resume) = self
+            .resumes
+            .iter()
+            .find(|resume| resume.file_name() == which)
+            .cloned()
+        else {
             return;
         };
         if self.title.map(|id| id.key()) != Some(resume.game.as_str()) {
@@ -2379,30 +2547,48 @@ impl State {
     }
 
     /// Forget an export that was put down, without running it.
-    pub fn forget_resume(&mut self) {
-        storage::clear_resume();
-        self.resume = None;
-        self.status = "put-down export forgotten".into();
+    pub fn forget_resume(&mut self, which: String) {
+        if let Some(at) = self
+            .resumes
+            .iter()
+            .position(|resume| resume.file_name() == which)
+        {
+            let resume = self.resumes.remove(at);
+            storage::clear_resume(&resume);
+            self.status = "put-down export forgotten".into();
+        }
     }
 
-    /// A resumed run that reached the end clears what it was resuming from.
+    /// A run that reached the end clears the note it was picked up from.
+    ///
+    /// A run that was cancelled does not: it is exactly the one somebody comes
+    /// back to.
     fn pump_resume(&mut self) {
         if !self.resuming {
             return;
         }
-        let (running, done, failed, total) = self
-            .queue
-            .progress
-            .lock()
-            .map(|p| (p.running, p.done, p.failed, p.total))
-            .unwrap_or((false, 0, 0, 0));
+        let (running, done, failed, total, note) = {
+            let Ok(lock) = self.queue.progress.lock() else {
+                return;
+            };
+            (
+                lock.running,
+                lock.done,
+                lock.failed,
+                lock.total,
+                lock.resume.clone(),
+            )
+        };
         if running || total == 0 {
             return;
         }
         self.resuming = false;
-        if done + failed >= total {
-            storage::clear_resume();
-            self.resume = None;
+        if done + failed >= total
+            && let Some(note) = note
+        {
+            storage::clear_resume(&note);
+            self.resumes
+                .retain(|other| other.file_name() != note.file_name());
             self.status = format!("export finished: {done} written, {failed} failed");
         }
     }
@@ -2512,9 +2698,9 @@ impl State {
         if resuming {
             log.say(format!(
                 "resuming  picked up from {}, files already there are stepped over",
-                self.resume
-                    .as_ref()
-                    .map(|r| r.at.as_str())
+                self.resumes
+                    .first()
+                    .map(|resume| resume.at.as_str())
                     .unwrap_or("an earlier run")
             ));
         }
@@ -2534,20 +2720,45 @@ impl State {
         self.show_queue = true;
         self.export_since = Some(crate::hm::discord::now_ms());
         self.resuming = resuming;
-        self.library_at = Some(folder.clone());
-        self.status = format!(
-            "extracting {} sounds into {folder}",
+        let label = format!(
+            "{} \u{b7} {} sounds",
+            self.title.map(|id| id.abbr()).unwrap_or("unknown"),
             ui::widgets::tally(chosen.len())
         );
-        self.queue.start(
+        // What this run would be written down as if the window were closed on
+        // it: the counts are filled in at the moment it is put down.
+        let note = storage::Resume {
+            game: game.clone(),
+            label: self.title.map(title_label).unwrap_or("unknown").to_string(),
+            root: self.root.clone().unwrap_or_default(),
+            into: into.clone(),
+            folder: folder.clone(),
+            format: self.options.format.label().to_string(),
+            layout: self.options.layout.label().to_string(),
+            normalise_names: self.options.normalise_names,
+            write_manifest: self.options.write_manifest,
+            skip: self.settings.skip.clone(),
+            done: 0,
+            failed: 0,
+            total: chosen.len(),
+            at: storage::stamp(),
+        };
+        let now = self.queue.submit(crate::hm::export::queue::Run {
+            id: crate::hm::export::queue::next_id(),
+            label: label.clone(),
             mount,
-            chosen,
-            self.mounted.packages.clone(),
+            entries: chosen,
+            packages: self.mounted.packages.clone(),
             game,
             root,
-            self.options.clone(),
-            Some(log),
-        );
+            options: self.options.clone(),
+            log: Some(log),
+            resume: Some(note),
+        });
+        self.status = match now {
+            true => format!("extracting into {folder}"),
+            false => format!("{label} queued behind the export already running"),
+        };
     }
 
     /// What the presence line says while an export is running, or nothing when

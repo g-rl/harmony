@@ -126,11 +126,20 @@ Harmony fingerprints the folder, says what it found and how it knows, and then:
   under, and the first folder of the sound's own name — because on some titles it is one
   and on some it is the other. Only the library run leaves anything out; `extract shown`
   writes exactly what is on screen.
+- **a second export while one is running** joins the line rather than replacing it. The run
+  that is going is never interrupted by a click somewhere else: the new one waits, and
+  starts on its own when the one in front finishes. Each run carries its own mount, so the
+  line can hold two different games at once. From the queue window any waiting run can be
+  moved to the front, taken out, or the whole line held so that nothing new starts when the
+  one going ends; **cancel** stops the run that is going and lets the rest carry on, and
+  **cancel all** stops the line with it.
 - **closing while something is running** asks first. An export can be put down rather than
   thrown away: harmony writes what the run was — game, folder, format, tree, what was left
   out — and the next time that game is open there is a **resume export** button that runs
   the same thing again with `skip existing` on, so every file already written is stepped
-  over and the rest carries on. What is not written down is which sounds got written: the
+  over and the rest carries on. Every run in the line is written down, not only the one
+  that was going, and each gets a file of its own, so closing on a queue of five exports
+  loses none of them. What is not written down is which sounds got written: the
   folder on disk is that list, and it cannot fall out of step the way a list could.
 - **folder tree** is one ladder of five, shallowest first: `file only` writes straight into
   the export folder, `sound path` keeps the folders the sound's own name carries, and
@@ -180,6 +189,14 @@ ninety-nine banks costing nine gigabytes of memory and costing none.
 
 Harmony draws on the gpu where there is one and falls back rather than fails where there is
 not: wgpu first (vulkan or dx12), then opengl.
+
+The paths harmony remembers are checked every few seconds on a worker, never on the thread
+that draws: a drive that has been unplugged can take seconds to admit it. A game folder
+that has gone is quietly forgotten and its tab goes back to having no folder behind it, the
+export folder goes back to being asked for, a moved cache or scratch folder falls back to
+the default beside the settings, and a put-down export whose folder is gone stops being
+offered. Only a plain “not found” counts: a permission, a busy drive or a share that is
+reconnecting keeps the path, because forgetting it would lose something you still have.
 
 Rich presence, when it is turned on, says what is actually happening: the sound being
 listened to and the game it is from, the game changing the moment a tab does, and an export
@@ -271,8 +288,8 @@ harmony --sort <game key> <depth>              # how a cached scan files itself
 
 `%APPDATA%\harmony\`: `settings.json` (the folder remembered for each game, output,
 favorites, tags, collections, presets, window size) and `scan-<game>-<depth>.json` (the cached catalogue of a scan) and
-`zones-<game>.json` (what each fastfile turned out to hold), and `resume.json` when an
-export has been put down and not yet picked up.
+`zones-<game>.json` (what each fastfile turned out to hold), and a `resume` folder holding one
+note per export that has been put down and not yet picked up.
 
 All three writing folders can be moved, from **folders** in the right-hand panel:
 

@@ -1,4 +1,5 @@
 pub mod space;
+pub mod watch;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -158,17 +159,74 @@ pub struct Resume {
     pub at: String,
 }
 
-pub fn resume_path() -> PathBuf {
-    config_dir().join("resume.json")
+/// Where the put-down exports are kept: one file each.
+///
+/// One file rather than one list, because a run is put down and picked up on
+/// its own and losing one should never mean losing the others. A run that was
+/// still waiting its turn when harmony closed is written down here too, with
+/// nothing done yet, so a line of five exports survives being closed on.
+pub fn resume_dir() -> PathBuf {
+    config_dir().join("resume")
 }
 
-pub fn load_resume() -> Option<Resume> {
-    let text = std::fs::read_to_string(resume_path()).ok()?;
-    serde_json::from_str(&text).ok()
+impl Resume {
+    /// The file this run is kept in.
+    ///
+    /// Named after the game and the folder it writes into, because that pair
+    /// is what a run *is*: sending the same library to the same folder twice
+    /// is the same run, and it should land on the same file rather than
+    /// leaving a second one behind to be picked up later.
+    pub fn file_name(&self) -> String {
+        let stem = format!("{}-{}", self.game, self.folder);
+        let safe: String = stem
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ' ' | '[' | ']' | '.' => c,
+                _ => '_',
+            })
+            .collect();
+        format!("{safe}.json")
+    }
+
+    pub fn path(&self) -> PathBuf {
+        resume_dir().join(self.file_name())
+    }
+}
+
+/// Every export that was put down and not yet picked up, newest first.
+pub fn load_resumes() -> Vec<Resume> {
+    // Settings written before there was a folder kept one run in one file.
+    // It is read once and moved in, rather than being left behind where
+    // nothing would ever look at it again.
+    let old = config_dir().join("resume.json");
+    if let Ok(text) = std::fs::read_to_string(&old) {
+        if let Ok(resume) = serde_json::from_str::<Resume>(&text) {
+            save_resume(&resume);
+        }
+        let _ = std::fs::remove_file(&old);
+    }
+
+    let Ok(entries) = std::fs::read_dir(resume_dir()) else {
+        return Vec::new();
+    };
+    let mut found: Vec<Resume> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".json")
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str::<Resume>(&text).ok())
+        .collect();
+    found.sort_by(|a, b| b.at.cmp(&a.at));
+    found
 }
 
 pub fn save_resume(resume: &Resume) {
-    let path = resume_path();
+    let path = resume.path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -177,8 +235,9 @@ pub fn save_resume(resume: &Resume) {
     }
 }
 
-pub fn clear_resume() {
-    let _ = std::fs::remove_file(resume_path());
+/// Forget one put-down export.
+pub fn clear_resume(resume: &Resume) {
+    let _ = std::fs::remove_file(resume.path());
 }
 
 pub fn config_dir() -> PathBuf {
@@ -529,5 +588,47 @@ mod tests {
     fn moving_a_folder_onto_itself_does_nothing() {
         let here = std::env::temp_dir();
         assert_eq!(move_caches(&here, &here), 0);
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn note(game: &str, folder: &str) -> Resume {
+        Resume {
+            game: game.into(),
+            label: "black ops iii".into(),
+            root: PathBuf::from("D:/games/bo3"),
+            into: PathBuf::from("D:/out"),
+            folder: folder.into(),
+            format: "flac".into(),
+            layout: "category/package".into(),
+            normalise_names: true,
+            write_manifest: false,
+            skip: vec!["voice".into()],
+            done: 12,
+            failed: 0,
+            total: 100,
+            at: "2026-09-19 10:00".into(),
+        }
+    }
+
+    /// A run is its game and the folder it writes into, and that is what names
+    /// its file: the same run put down twice lands on the same note rather
+    /// than leaving a second one to be picked up later.
+    #[test]
+    fn a_note_is_named_after_its_run() {
+        let first = note("t7", "[t7] black ops iii - 1.0.0.2");
+        assert_eq!(first.file_name(), "t7-[t7] black ops iii - 1.0.0.2.json");
+        assert_eq!(note("t7", "[t7] black ops iii - 1.0.0.2").file_name(), first.file_name());
+        assert_ne!(note("t6", "[t6] black ops ii").file_name(), first.file_name());
+    }
+
+    /// Anything a filesystem would argue about is written as an underscore.
+    #[test]
+    fn a_note_name_is_a_filename() {
+        let odd = note("t7", "x/y\\z:*?");
+        assert_eq!(odd.file_name(), "t7-x_y_z___.json");
     }
 }

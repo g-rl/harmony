@@ -379,12 +379,19 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
         }
     }
 
-    // An export that was put down, here or in an earlier run of harmony. It
-    // only shows on the game it belongs to, and picking it up steps over every
-    // file that is already written.
-    if let Some(resume) = state.resume.clone()
-        && state.title.map(|id| id.key()) == Some(resume.game.as_str())
-    {
+    // Exports that were put down, here or in an earlier run of harmony: one
+    // note each, kept in their own files so losing one never means losing the
+    // others. Only the ones belonging to the game on screen are shown, and
+    // picking one up steps over every file that is already written.
+    let mine: Vec<crate::hm::storage::Resume> = state
+        .resumes
+        .iter()
+        .filter(|resume| state.title.map(|id| id.key()) == Some(resume.game.as_str()))
+        .cloned()
+        .collect();
+    let mut take_up: Option<String> = None;
+    let mut forget: Option<String> = None;
+    for resume in &mine {
         ui.add_space(4.0);
         ui.colored_label(
             theme::DIM,
@@ -401,12 +408,18 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
                 .on_hover_text(format!("carry on into {}", resume.folder))
                 .clicked()
             {
-                state.resume_export();
+                take_up = Some(resume.file_name());
             }
             if ui.button("forget it").clicked() {
-                state.forget_resume();
+                forget = Some(resume.file_name());
             }
         });
+    }
+    if let Some(which) = take_up {
+        state.resume_export(which);
+    }
+    if let Some(which) = forget {
+        state.forget_resume(which);
     }
 
     let mut discord = state.settings.discord;

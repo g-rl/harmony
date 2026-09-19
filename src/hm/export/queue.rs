@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -67,6 +67,13 @@ pub struct Progress {
     pub workers: usize,
     /// Where the log of this run is being kept, for the runs that keep one.
     pub logged: Option<PathBuf>,
+    /// What the run that is going is called.
+    pub label: String,
+    /// What this run would be written down as if it were put down half way.
+    /// Only a library run carries one.
+    pub resume: Option<crate::hm::storage::Resume>,
+    /// The runs behind this one, in the order they will start.
+    pub waiting: Vec<Waiting>,
     /// Set when the queue stopped itself because the disk it is writing to
     /// ran out of room. The work is paused, not abandoned: clearing this and
     /// unpausing carries on from the file it stopped at.
@@ -90,10 +97,55 @@ impl Progress {
     }
 }
 
+/// One export, everything it needs to run, waiting its turn.
+///
+/// A run carries its own mount, so two games can be lined up behind each
+/// other: the second one does not borrow anything from the first.
+pub struct Run {
+    pub id: u64,
+    /// What the window calls this run: `bo3 · 27,605 sounds`.
+    pub label: String,
+    pub mount: Arc<Mutex<Mount>>,
+    pub entries: Vec<Entry>,
+    pub packages: Vec<String>,
+    pub game: String,
+    pub root: PathBuf,
+    pub options: Options,
+    pub log: Option<liblog::Log>,
+    /// What to write down if this run is put down half way. Only a library run
+    /// has one: it owns a folder of its own, which is what tells a resumed run
+    /// what is already there.
+    pub resume: Option<crate::hm::storage::Resume>,
+}
+
+/// A run that has not started yet, as the window sees it.
+#[derive(Clone, Debug)]
+pub struct Waiting {
+    pub id: u64,
+    pub label: String,
+    pub total: usize,
+}
+
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_id() -> u64 {
+    NEXT_RUN.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Queue {
     pub progress: Arc<Mutex<Progress>>,
+    /// Cancels the run that is going, not the ones behind it.
     pub cancel: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
+    /// Runs that have not started. Sending a second export while one is going
+    /// adds to this rather than throwing the first one away.
+    pending: Arc<Mutex<VecDeque<Run>>>,
+    /// Whether a thread is working through the line. Kept under the same lock
+    /// as `pending`, so a run cannot be added at the moment the last one ends
+    /// and be left sitting there with nobody to start it.
+    driving: Arc<Mutex<bool>>,
+    /// Stop after the run that is going, rather than starting the next.
+    pub hold: Arc<AtomicBool>,
 }
 
 impl Default for Queue {
@@ -102,6 +154,9 @@ impl Default for Queue {
             progress: Arc::new(Mutex::new(Progress::default())),
             cancel: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            driving: Arc::new(Mutex::new(false)),
+            hold: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -120,272 +175,427 @@ impl Queue {
             .unwrap_or(2)
     }
 
-    pub fn start(
-        &self,
-        mount: Arc<Mutex<Mount>>,
-        entries: Vec<Entry>,
-        packages: Vec<String>,
-        game: String,
-        root: PathBuf,
-        options: Options,
-        log: Option<liblog::Log>,
-    ) {
-        let total = entries.len();
-        let bulk = total > LISTED;
-        let workers = Self::workers();
-        {
-            let mut progress = self.progress.lock().unwrap();
-            // A run small enough to read keeps a row for every sound. A bulk
-            // run keeps none: see `LISTED`.
-            progress.jobs = match bulk {
-                true => Vec::new(),
-                false => entries
-                    .iter()
-                    .map(|entry| Job {
-                        label: entry.display(),
-                        state: JobState::Waiting,
-                    })
-                    .collect(),
-            };
-            progress.done = 0;
-            progress.failed = 0;
-            progress.total = total;
-            progress.running = true;
-            progress.output = Some(root.clone());
-            progress.stalled = None;
-            progress.bulk = bulk;
-            progress.started = Some(Instant::now());
-            progress.recent.clear();
-            progress.failures.clear();
-            progress.bytes = 0;
-            progress.workers = workers;
-            progress.logged = log.as_ref().map(|log| log.path().to_path_buf());
+    /// Put a run in the line.
+    ///
+    /// Nothing going: it starts. Something going: it waits, and the one that
+    /// is running is not disturbed — which is the whole point, because the
+    /// alternative is an afternoon of writing thrown away by a click.
+    ///
+    /// Returns true when this run started straight away.
+    pub fn submit(&self, run: Run) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        let mut driving = self.driving.lock().unwrap();
+        pending.push_back(run);
+        self.note_waiting(&pending);
+        // Said here rather than on the driver thread: a caller that asks
+        // straight away whether anything is running should be told yes,
+        // instead of racing the thread that is about to start.
+        if let Ok(mut lock) = self.progress.lock() {
+            lock.running = true;
         }
-        self.cancel.store(false, Ordering::Relaxed);
-        self.paused.store(false, Ordering::Relaxed);
+        if *driving {
+            return false;
+        }
+        *driving = true;
+        drop(driving);
+        drop(pending);
+        self.drive();
+        true
+    }
 
+    /// The thread that works through the line, one run at a time.
+    fn drive(&self) {
         let progress = self.progress.clone();
         let cancel = self.cancel.clone();
         let paused = self.paused.clone();
+        let pending = self.pending.clone();
+        let driving = self.driving.clone();
+        let hold = self.hold.clone();
+        let waiting_note = self.progress.clone();
 
-        // One thread to run the pool, so the caller is never held up and the
-        // manifest is written once, after the last worker has stopped.
         std::thread::spawn(move || {
-            let entries = Arc::new(entries);
-            let packages = Arc::new(packages);
-            let options = Arc::new(options);
-            let root = Arc::new(root);
-            let next = Arc::new(AtomicUsize::new(0));
-            let rows = Arc::new(Mutex::new(Vec::<manifest::Row>::new()));
-            // Every failure, not the capped handful the window shows: a log is
-            // read afterwards, when the whole list is the point.
-            let fails = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
-            let began = Instant::now();
-
-            let mut log = log;
-            if let Some(log) = log.as_mut() {
-                log.flush();
-            }
-
-            let mut hands = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let entries = entries.clone();
-                let packages = packages.clone();
-                let options = options.clone();
-                let root = root.clone();
-                let next = next.clone();
-                let rows = rows.clone();
-                let fails = fails.clone();
-                let progress = progress.clone();
-                let cancel = cancel.clone();
-                let paused = paused.clone();
-                let mount = mount.clone();
-                let game = game.clone();
-                hands.push(std::thread::spawn(move || {
-                    let mut mine: Vec<manifest::Row> = Vec::new();
-                    let mut mine_failed: Vec<(String, String)> = Vec::new();
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(entry) = entries.get(index) else {
-                            break;
-                        };
-                        if cancel.load(Ordering::Relaxed) {
-                            break;
+            loop {
+                // Nothing left to do, and the flag goes down under the same
+                // lock a new run would be added under: a run cannot arrive in
+                // the moment between finding the line empty and saying so.
+                {
+                    let line = pending.lock().unwrap();
+                    let mut going = driving.lock().unwrap();
+                    if line.is_empty() {
+                        *going = false;
+                        if let Ok(mut lock) = progress.lock() {
+                            lock.running = false;
                         }
-                        // A disk can fill up while the queue is running, and a
-                        // run that fails every remaining file is no use to
-                        // anybody. Every so often, and whenever the next file
-                        // is a big one, the room is measured again; if it has
-                        // gone, the queue pauses itself and says so, and waits
-                        // for the user to make room or cancel.
-                        if index % 16 == 0 || entry.bytes > 8 * 1024 * 1024 {
-                            let want =
-                                super::estimate(std::slice::from_ref(entry), options.format);
-                            if let Some(room) = space::shortfall(&root, want) {
-                                let mut lock = progress.lock().unwrap();
-                                lock.stalled = Some(Stall {
-                                    path: room.path.clone(),
-                                    free: room.free,
-                                    want: room.needed(),
-                                });
-                                drop(lock);
-                                paused.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        while paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_millis(80));
-                        }
-                        if cancel.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        {
-                            let mut lock = progress.lock().unwrap();
-                            if let Some(job) = lock.jobs.get_mut(index) {
-                                job.state = JobState::Running;
-                            }
-                        }
-
-                        let package = packages
-                            .get(entry.package.0 as usize)
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".into());
-                        let result = run_one(&mount, entry, &package, &root, &options);
-
-                        let mut lock = progress.lock().unwrap();
-                        match result {
-                            Ok(path) => {
-                                if let Some(job) = lock.jobs.get_mut(index) {
-                                    job.state = JobState::Done;
-                                }
-                                lock.done += 1;
-                                lock.bytes += std::fs::metadata(&path)
-                                    .map(|about| about.len())
-                                    .unwrap_or(0);
-                                // The tail the bulk card shows: a few names, so
-                                // a long run looks like it is moving through the
-                                // library rather than sitting still.
-                                lock.recent.push_back(entry.display());
-                                while lock.recent.len() > RECENT {
-                                    lock.recent.pop_front();
-                                }
-                                if options.write_manifest {
-                                    mine.push(manifest::Row {
-                                        name: entry.display(),
-                                        game: game.clone(),
-                                        category: entry.category.label().to_string(),
-                                        package,
-                                        source: match entry.source {
-                                            Source::Stream { key } => format!("{key:016x}"),
-                                            Source::Bank { package, index } => {
-                                                format!("bank {}:{index}", package.0)
-                                            }
-                                        },
-                                        output: path.to_string_lossy().to_string(),
-                                        format: options.format.label().to_string(),
-                                        rate: entry.rate,
-                                        channels: entry.channels,
-                                        seconds: entry.seconds(),
-                                        at: stamp(),
-                                    });
-                                }
-                            }
-                            Err(error) => {
-                                if let Some(job) = lock.jobs.get_mut(index) {
-                                    job.state = JobState::Failed(error.clone());
-                                }
-                                lock.failed += 1;
-                                if lock.failures.len() < FAILURES {
-                                    lock.failures.push((entry.display(), error.clone()));
-                                }
-                                mine_failed.push((entry.display(), error));
-                            }
-                        }
+                        break;
                     }
-                    if !mine.is_empty() {
-                        rows.lock().unwrap().extend(mine);
+                }
+                // Held: the run that was going has already finished, so
+                // nothing is interrupted. The line simply does not move until
+                // the hold comes off.
+                if hold.load(Ordering::Relaxed) {
+                    if let Ok(mut lock) = progress.lock() {
+                        lock.running = false;
                     }
-                    if !mine_failed.is_empty() {
-                        fails.lock().unwrap().extend(mine_failed);
-                    }
-                }));
-            }
-
-            // While the pool runs, the log is rewritten every so often, so a
-            // run that is killed outright still leaves something readable.
-            if log.is_some() {
-                let mut wrote = Instant::now();
-                while !hands.iter().all(|hand| hand.is_finished()) {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    if wrote.elapsed() < CHECKPOINT {
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    continue;
+                }
+                let run = {
+                    let mut line = pending.lock().unwrap();
+                    let Some(run) = line.pop_front() else {
                         continue;
-                    }
-                    wrote = Instant::now();
-                    let (done, failed) = {
-                        let lock = progress.lock().unwrap();
-                        (lock.done, lock.failed)
                     };
-                    if let Some(log) = log.as_mut() {
-                        let mut so_far = log.clone();
-                        so_far.say(format!(
-                            "still running: {done} written, {failed} failed, {} in after {}",
-                            total,
-                            liblog::spell(began.elapsed().as_secs_f32())
-                        ));
-                        so_far.flush();
+                    let left: Vec<Waiting> = line
+                        .iter()
+                        .map(|run| Waiting {
+                            id: run.id,
+                            label: run.label.clone(),
+                            total: run.entries.len(),
+                        })
+                        .collect();
+                    if let Ok(mut lock) = waiting_note.lock() {
+                        lock.waiting = left;
                     }
-                }
+                    run
+                };
+                execute(run, &progress, &cancel, &paused);
             }
-
-            for hand in hands {
-                let _ = hand.join();
-            }
-
-            if options.write_manifest {
-                let rows = rows.lock().unwrap();
-                if !rows.is_empty() {
-                    let _ = manifest::write(&root.join("manifest.json"), &rows);
-                }
-            }
-
-            let (done, failed) = {
-                let lock = progress.lock().unwrap();
-                (lock.done, lock.failed)
-            };
-            if let Some(log) = log.as_mut() {
-                let stopped = cancel.load(Ordering::Relaxed);
-                log.blank();
-                log.say(match stopped {
-                    true => "cancelled",
-                    false => "finished",
-                });
-                log.say(format!("written   {done}"));
-                log.say(format!("failed    {failed}"));
-                log.say(format!("asked for {total}"));
-                log.say(format!("took      {}", liblog::spell(began.elapsed().as_secs_f32())));
-                log.say(format!("ended     {}", stamp()));
-                let fails = fails.lock().unwrap();
-                if !fails.is_empty() {
-                    log.blank();
-                    log.say(format!("what failed ({})", fails.len()));
-                    for (name, why) in fails.iter() {
-                        log.say(format!("  {name}  {why}"));
-                    }
-                }
-                log.flush();
-            }
-
-            let mut lock = progress.lock().unwrap();
-            lock.running = false;
         });
     }
 
+    /// Tell the window what is still waiting.
+    fn note_waiting(&self, pending: &VecDeque<Run>) {
+        if let Ok(mut lock) = self.progress.lock() {
+            lock.waiting = pending
+                .iter()
+                .map(|run| Waiting {
+                    id: run.id,
+                    label: run.label.clone(),
+                    total: run.entries.len(),
+                })
+                .collect();
+        }
+    }
+
+    /// Move a waiting run to the front, so it is the next one to start.
+    pub fn promote(&self, id: u64) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(at) = pending.iter().position(|run| run.id == id)
+            && let Some(run) = pending.remove(at)
+        {
+            pending.push_front(run);
+        }
+        self.note_waiting(&pending);
+    }
+
+    /// Take a run out of the line without touching the one that is going.
+    pub fn drop_waiting(&self, id: u64) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|run| run.id != id);
+        self.note_waiting(&pending);
+    }
+
+    /// What every run still waiting would be written down as, for a window
+    /// that is closing on them: the ones in the line have got nowhere yet, so
+    /// their notes are exactly what they were sent with.
+    pub fn notes(&self) -> Vec<crate::hm::storage::Resume> {
+        self.pending
+            .lock()
+            .map(|line| line.iter().filter_map(|run| run.resume.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Empty the line. The run that is going keeps going.
+    pub fn clear_waiting(&self) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.clear();
+        self.note_waiting(&pending);
+    }
+
+    /// Stop the run that is going. The line carries on with the next one.
     pub fn stop(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop everything: the run that is going and everything behind it.
+    pub fn stop_all(&self) {
+        self.clear_waiting();
         self.cancel.store(true, Ordering::Relaxed);
     }
 
     pub fn toggle_pause(&self) {
         let now = self.paused.load(Ordering::Relaxed);
         self.paused.store(!now, Ordering::Relaxed);
+    }
+
+    /// Hold the line after the run that is going, or let it carry on.
+    pub fn toggle_hold(&self) {
+        let now = self.hold.load(Ordering::Relaxed);
+        self.hold.store(!now, Ordering::Relaxed);
+    }
+
+    pub fn holding(&self) -> bool {
+        self.hold.load(Ordering::Relaxed)
+    }
+}
+
+/// Run one export to the end.
+///
+/// Every field of `Progress` that describes a run is set here, at the top,
+/// because the run before this one left its own numbers behind and the window
+/// reads them both out of the same place.
+fn execute(
+    run: Run,
+    progress: &Arc<Mutex<Progress>>,
+    cancel: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+) {
+    let Run {
+        label,
+        mount,
+        entries,
+        packages,
+        game,
+        root,
+        options,
+        log,
+        resume,
+        ..
+    } = run;
+
+    let total = entries.len();
+    let bulk = total > LISTED;
+    let workers = Queue::workers();
+    {
+        let mut lock = progress.lock().unwrap();
+        // A run small enough to read keeps a row for every sound. A bulk run
+        // keeps none: see `LISTED`.
+        lock.jobs = match bulk {
+            true => Vec::new(),
+            false => entries
+                .iter()
+                .map(|entry| Job {
+                    label: entry.display(),
+                    state: JobState::Waiting,
+                })
+                .collect(),
+        };
+        lock.done = 0;
+        lock.failed = 0;
+        lock.total = total;
+        lock.running = true;
+        lock.output = Some(root.clone());
+        lock.stalled = None;
+        lock.bulk = bulk;
+        lock.started = Some(Instant::now());
+        lock.recent.clear();
+        lock.failures.clear();
+        lock.bytes = 0;
+        lock.workers = workers;
+        lock.logged = log.as_ref().map(|log| log.path().to_path_buf());
+        lock.label = label;
+        lock.resume = resume;
+    }
+    cancel.store(false, Ordering::Relaxed);
+    paused.store(false, Ordering::Relaxed);
+
+    let entries = Arc::new(entries);
+    let packages = Arc::new(packages);
+    let options = Arc::new(options);
+    let root = Arc::new(root);
+    let next = Arc::new(AtomicUsize::new(0));
+    let rows = Arc::new(Mutex::new(Vec::<manifest::Row>::new()));
+    // Every failure, not the capped handful the window shows: a log is read
+    // afterwards, when the whole list is the point.
+    let fails = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let began = Instant::now();
+
+    let mut log = log;
+    if let Some(log) = log.as_mut() {
+        log.flush();
+    }
+
+    let mut hands = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let entries = entries.clone();
+        let packages = packages.clone();
+        let options = options.clone();
+        let root = root.clone();
+        let next = next.clone();
+        let rows = rows.clone();
+        let fails = fails.clone();
+        let progress = progress.clone();
+        let cancel = cancel.clone();
+        let paused = paused.clone();
+        let mount = mount.clone();
+        let game = game.clone();
+        hands.push(std::thread::spawn(move || {
+            let mut mine: Vec<manifest::Row> = Vec::new();
+            let mut mine_failed: Vec<(String, String)> = Vec::new();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(entry) = entries.get(index) else {
+                    break;
+                };
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                // A disk can fill up while the queue is running, and a run that
+                // fails every remaining file is no use to anybody. Every so
+                // often, and whenever the next file is a big one, the room is
+                // measured again; if it has gone, the queue pauses itself and
+                // says so, and waits for the user to make room or cancel.
+                if index % 16 == 0 || entry.bytes > 8 * 1024 * 1024 {
+                    let want = super::estimate(std::slice::from_ref(entry), options.format);
+                    if let Some(room) = space::shortfall(&root, want) {
+                        let mut lock = progress.lock().unwrap();
+                        lock.stalled = Some(Stall {
+                            path: room.path.clone(),
+                            free: room.free,
+                            want: room.needed(),
+                        });
+                        drop(lock);
+                        paused.store(true, Ordering::Relaxed);
+                    }
+                }
+                while paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                {
+                    let mut lock = progress.lock().unwrap();
+                    if let Some(job) = lock.jobs.get_mut(index) {
+                        job.state = JobState::Running;
+                    }
+                }
+
+                let package = packages
+                    .get(entry.package.0 as usize)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".into());
+                let result = run_one(&mount, entry, &package, &root, &options);
+
+                let mut lock = progress.lock().unwrap();
+                match result {
+                    Ok(path) => {
+                        if let Some(job) = lock.jobs.get_mut(index) {
+                            job.state = JobState::Done;
+                        }
+                        lock.done += 1;
+                        lock.bytes += std::fs::metadata(&path)
+                            .map(|about| about.len())
+                            .unwrap_or(0);
+                        // The tail the bulk card shows: a few names, so a long
+                        // run looks like it is moving through the library
+                        // rather than sitting still.
+                        lock.recent.push_back(entry.display());
+                        while lock.recent.len() > RECENT {
+                            lock.recent.pop_front();
+                        }
+                        if options.write_manifest {
+                            mine.push(manifest::Row {
+                                name: entry.display(),
+                                game: game.clone(),
+                                category: entry.category.label().to_string(),
+                                package,
+                                source: match entry.source {
+                                    Source::Stream { key } => format!("{key:016x}"),
+                                    Source::Bank { package, index } => {
+                                        format!("bank {}:{index}", package.0)
+                                    }
+                                },
+                                output: path.to_string_lossy().to_string(),
+                                format: options.format.label().to_string(),
+                                rate: entry.rate,
+                                channels: entry.channels,
+                                seconds: entry.seconds(),
+                                at: stamp(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(job) = lock.jobs.get_mut(index) {
+                            job.state = JobState::Failed(error.clone());
+                        }
+                        lock.failed += 1;
+                        if lock.failures.len() < FAILURES {
+                            lock.failures.push((entry.display(), error.clone()));
+                        }
+                        mine_failed.push((entry.display(), error));
+                    }
+                }
+            }
+            if !mine.is_empty() {
+                rows.lock().unwrap().extend(mine);
+            }
+            if !mine_failed.is_empty() {
+                fails.lock().unwrap().extend(mine_failed);
+            }
+        }));
+    }
+
+    // While the pool runs, the log is rewritten every so often, so a run that
+    // is killed outright still leaves something readable.
+    if log.is_some() {
+        let mut wrote = Instant::now();
+        while !hands.iter().all(|hand| hand.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if wrote.elapsed() < CHECKPOINT {
+                continue;
+            }
+            wrote = Instant::now();
+            let (done, failed) = {
+                let lock = progress.lock().unwrap();
+                (lock.done, lock.failed)
+            };
+            if let Some(log) = log.as_mut() {
+                let mut so_far = log.clone();
+                so_far.say(format!(
+                    "still running: {done} written, {failed} failed, {total} in after {}",
+                    liblog::spell(began.elapsed().as_secs_f32())
+                ));
+                so_far.flush();
+            }
+        }
+    }
+
+    for hand in hands {
+        let _ = hand.join();
+    }
+
+    if options.write_manifest {
+        let rows = rows.lock().unwrap();
+        if !rows.is_empty() {
+            let _ = manifest::write(&root.join("manifest.json"), &rows);
+        }
+    }
+
+    let (done, failed) = {
+        let lock = progress.lock().unwrap();
+        (lock.done, lock.failed)
+    };
+    if let Some(log) = log.as_mut() {
+        let stopped = cancel.load(Ordering::Relaxed);
+        log.blank();
+        log.say(match stopped {
+            true => "cancelled",
+            false => "finished",
+        });
+        log.say(format!("written   {done}"));
+        log.say(format!("failed    {failed}"));
+        log.say(format!("asked for {total}"));
+        log.say(format!("took      {}", liblog::spell(began.elapsed().as_secs_f32())));
+        log.say(format!("ended     {}", stamp()));
+        let fails = fails.lock().unwrap();
+        if !fails.is_empty() {
+            log.blank();
+            log.say(format!("what failed ({})", fails.len()));
+            for (name, why) in fails.iter() {
+                log.say(format!("  {name}  {why}"));
+            }
+        }
+        log.flush();
     }
 }
 

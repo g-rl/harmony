@@ -1118,8 +1118,11 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
         .map(|info| info.name.clone())
         .collect();
 
+    // One queue, four runs, sent one after another without waiting: exactly
+    // what the window does when a second export is asked for while one is
+    // going. The line runs them in the order they were sent.
+    let queue = Queue::default();
     for format in hm::export::FORMATS.iter().copied() {
-        let queue = Queue::default();
         let mut options = Options::default();
         options.format = format;
         options.write_manifest = true;
@@ -1133,32 +1136,66 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
         log.say(format!("format    {}", format.label()));
         log.say(format!("sounds    {}", entries.len()));
         log.blank();
-        queue.start(
-            mount.clone(),
-            entries.clone(),
-            packages.clone(),
-            "jup".into(),
-            folder.clone(),
+        let started = queue.submit(hm::export::queue::Run {
+            id: hm::export::queue::next_id(),
+            label: format!("{} \u{b7} {} sounds", format.label(), entries.len()),
+            mount: mount.clone(),
+            entries: entries.clone(),
+            packages: packages.clone(),
+            game: "jup".into(),
+            root: folder,
             options,
-            Some(log),
-        );
-        loop {
-            let progress = queue.progress.lock().unwrap();
-            if !progress.running {
-                println!(
-                    "{}: {} written, {} failed",
-                    format.label(),
-                    progress.done,
-                    progress.failed
-                );
-                for job in progress.jobs.iter().take(3) {
-                    println!("  {} {:?}", job.label, job.state);
-                }
-                break;
+            log: Some(log),
+            resume: None,
+        });
+        println!(
+            "{}: {}",
+            format.label(),
+            match started {
+                true => "running",
+                false => "queued",
             }
-            drop(progress);
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        );
+    }
+
+    // Wait for the whole line, saying what is going and what is behind it.
+    let mut said = String::new();
+    loop {
+        let (running, waiting, label, done, failed, total) = {
+            let progress = queue.progress.lock().unwrap();
+            (
+                progress.running,
+                progress.waiting.len(),
+                progress.label.clone(),
+                progress.done,
+                progress.failed,
+                progress.total,
+            )
+        };
+        if !running && waiting == 0 {
+            break;
         }
+        let now = format!("{label}: {done} written, {failed} failed of {total}, {waiting} waiting");
+        if now != said {
+            println!("{now}");
+            said = now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    // What actually landed, counted off the disk rather than off the queue.
+    for format in hm::export::FORMATS.iter().copied() {
+        let folder = out.join(format.label());
+        let written = std::fs::read_dir(&folder)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir() || entry.path().is_file())
+                    .count()
+            })
+            .unwrap_or(0);
+        println!("{}: {written} at the top of {}", format.label(), folder.display());
     }
     println!("output under {}", out.display());
 }
+

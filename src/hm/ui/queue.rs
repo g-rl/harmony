@@ -47,6 +47,8 @@ struct Look {
     recent: Vec<String>,
     failures: Vec<(String, String)>,
     rows: usize,
+    label: String,
+    waiting: Vec<crate::hm::export::queue::Waiting>,
 }
 
 fn look(state: &State) -> Look {
@@ -67,6 +69,8 @@ fn look(state: &State) -> Look {
         recent: progress.recent.iter().cloned().collect(),
         failures: progress.failures.clone(),
         rows: progress.jobs.len(),
+        label: progress.label.clone(),
+        waiting: progress.waiting.clone(),
     }
 }
 
@@ -84,8 +88,20 @@ fn body(ui: &mut egui::Ui, state: &mut State) {
             if ui.button(if paused { "resume" } else { "pause" }).clicked() {
                 state.queue.toggle_pause();
             }
-            if ui.button("cancel").clicked() {
+            if ui
+                .button("cancel")
+                .on_hover_text("stop this run; the ones behind it carry on")
+                .clicked()
+            {
                 state.queue.stop();
+            }
+            if !it.waiting.is_empty()
+                && ui
+                    .button("cancel all")
+                    .on_hover_text("stop this run and empty the line behind it")
+                    .clicked()
+            {
+                state.queue.stop_all();
             }
             if paused {
                 ui.colored_label(theme::UNLIT, "paused");
@@ -104,6 +120,15 @@ fn body(ui: &mut egui::Ui, state: &mut State) {
             retry(state);
         }
     });
+
+    if !it.label.is_empty() {
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(egui::RichText::new(it.label.as_str()).color(theme::TEXT))
+                .truncate()
+                .selectable(false),
+        );
+    }
 
     ui.add_space(4.0);
     widgets::meter(
@@ -130,9 +155,75 @@ fn body(ui: &mut egui::Ui, state: &mut State) {
         );
     }
 
+    line(ui, state, &it);
+
     match it.bulk {
         true => bulk(ui, &it),
         false => rows(ui, state, it.rows),
+    }
+}
+
+/// The runs behind this one.
+///
+/// Asking for a second export while one is going does not throw the first one
+/// away and does not make the second one wait for a person to come back: it
+/// joins the line and starts when the one in front of it finishes. From here
+/// any of them can be moved to the front, taken out, or the whole line held
+/// so that nothing new starts when the one going ends.
+fn line(ui: &mut egui::Ui, state: &mut State, it: &Look) {
+    if it.waiting.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    widgets::hairline(ui);
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.colored_label(
+            theme::DIM,
+            format!("{} waiting", widgets::tally(it.waiting.len())),
+        );
+        let holding = state.queue.holding();
+        if widgets::chip(ui, if holding { "held" } else { "hold" }, holding)
+            .on_hover_text("finish this run and stop, rather than starting the next")
+            .clicked()
+        {
+            state.queue.toggle_hold();
+        }
+        if ui
+            .small_button("clear waiting")
+            .on_hover_text("take them all out; the run that is going keeps going")
+            .clicked()
+        {
+            state.queue.clear_waiting();
+        }
+    });
+    ui.add_space(2.0);
+
+    let mut promote: Option<u64> = None;
+    let mut drop_it: Option<u64> = None;
+    for (at, run) in it.waiting.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.colored_label(theme::DIM, format!("{}.", at + 1));
+            ui.add(
+                egui::Label::new(egui::RichText::new(run.label.as_str()).color(theme::DIM))
+                    .truncate()
+                    .selectable(false),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("drop").clicked() {
+                    drop_it = Some(run.id);
+                }
+                if at > 0 && ui.small_button("next").on_hover_text("start this one next").clicked() {
+                    promote = Some(run.id);
+                }
+            });
+        });
+    }
+    if let Some(id) = promote {
+        state.queue.promote(id);
+    }
+    if let Some(id) = drop_it {
+        state.queue.drop_waiting(id);
     }
 }
 

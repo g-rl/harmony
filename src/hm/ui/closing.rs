@@ -42,6 +42,15 @@ pub fn window(ctx: &egui::Context, state: &mut State) {
                 ),
             );
         }
+        if busy.queued > 0 {
+            ui.colored_label(
+                theme::DIM,
+                format!(
+                    "{} more waiting behind it",
+                    widgets::tally(busy.queued)
+                ),
+            );
+        }
         if busy.scanning {
             ui.colored_label(
                 theme::DIM,
@@ -57,8 +66,9 @@ pub fn window(ctx: &egui::Context, state: &mut State) {
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            if busy.exporting.is_some()
-                && state.library_at.is_some()
+            // Offered when there is anything to write down: the run that is
+            // going, or a line of runs behind it that have not started.
+            if (state.resumable() || busy.queued > 0)
                 && ui
                     .button("pause and quit")
                     .on_hover_text(
@@ -89,7 +99,9 @@ pub fn window(ctx: &egui::Context, state: &mut State) {
             crate::hm::window::chrome::close(ctx);
         }
         Some(Answer::Quit) => {
-            state.queue.stop();
+            // Everything, not only the run that is going: the line behind it
+            // would otherwise start something new on the way out.
+            state.queue.stop_all();
             state.closing = false;
             state.quitting = true;
             crate::hm::window::chrome::close(ctx);
