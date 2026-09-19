@@ -1061,7 +1061,7 @@ fn stream(path: &std::path::Path) {
 /// Headless check: scan, then extract the first `count` sounds both ways and
 /// say what landed where.
 fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
-    use hm::export::{Format, Options, queue::Queue};
+    use hm::export::{Options, queue::Queue};
     use hm::game::{detect, title_for};
     use hm::scan::{self, Depth, Msg};
     use std::sync::{Arc, Mutex};
@@ -1118,7 +1118,7 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
         .map(|info| info.name.clone())
         .collect();
 
-    for format in [Format::Wav, Format::Ogg, Format::Raw] {
+    for format in hm::export::FORMATS.iter().copied() {
         let queue = Queue::default();
         let mut options = Options::default();
         options.format = format;

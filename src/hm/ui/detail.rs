@@ -247,7 +247,10 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         for format in FORMATS {
-            if widgets::chip(ui, format.label(), state.options.format == *format).clicked() {
+            if widgets::chip(ui, format.label(), state.options.format == *format)
+                .on_hover_text(format.about())
+                .clicked()
+            {
                 state.options.format = *format;
                 state.save_options();
             }
@@ -300,6 +303,22 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
             state.extract(false);
         }
     });
+
+    // The whole library, filter or no filter, into a folder named after the
+    // game and the build it came out of.
+    if !state.catalog.is_empty() {
+        let count = widgets::tally(state.catalog.len());
+        if ui
+            .button(format!("extract library ({count})"))
+            .on_hover_text(format!(
+                "every sound this game has, into {}",
+                state.library_folder(state.mounted.build.as_deref())
+            ))
+            .clicked()
+        {
+            state.extract_library();
+        }
+    }
 
     let mut discord = state.settings.discord;
     if ui.checkbox(&mut discord, "discord presence").changed() {

@@ -110,6 +110,13 @@ Harmony fingerprints the folder, says what it found and how it knows, and then:
   Ctrl-click adds to the selection, shift-click takes a run.
 - **extract** sends the selection (or everything shown) to the queue, which can be paused,
   cancelled and retried, and writes `manifest.json` alongside the audio when asked.
+- **extract library** takes the whole game, filter or no filter, into a folder of its own:
+  `[t7] black ops iii - 1.0.0.2`, named for the id, the game and the build it came out of,
+  so two patches of the same install never land on top of each other. A run that size is
+  written by every core the machine can spare bar two, and the queue window stops listing a
+  row per sound: it shows how fast it is going, how much has landed, how long is left, the
+  last few names and the failures, which is what a run of a hundred thousand is actually
+  watched by.
 - **folder tree** is one ladder of five, shallowest first: `file only` writes straight into
   the export folder, `sound path` keeps the folders the sound's own name carries, and
   `package`, `category/package` and `language/category` put one more level above that. The
@@ -120,9 +127,15 @@ Harmony fingerprints the folder, says what it found and how it knows, and then:
   then the drag itself begins. Dragging a row that is part of the selection carries the
   whole selection. Escape calls it off, and anything nobody took is deleted.
 
-Formats out: **wav** (decoded PCM), **ogg** (the original Opus packets remuxed, no
-re-encode — Opus titles only) and **raw** (the blob as the container holds it, with the
-header a sab bank leaves off put back).
+Formats out: **wav** (decoded PCM), **flac** (lossless), **ogg** (the original Opus packets
+remuxed, no re-encode — Opus titles only) and **raw** (the blob as the container holds it,
+with the header a sab bank leaves off put back).
+
+Flac is a copy rather than an encode wherever the sound is flac already, which is most of
+black ops iii, infinite warfare, black ops 4, ghosts and advanced warfare: re-encoding a
+lossless file changes nothing and costs time. Everything else — the pcm, the adpcm, the
+opus — is encoded from the decoded samples, and comes out bit for bit what the wav would
+have held in about half the space.
 
 A sound harmony could not name is still written somewhere you can find it again. The
 filename presets put the package in front of the key — `eng_codhq [a1b2c3d4e5f6]` — so a
@@ -152,6 +165,12 @@ ninety-nine banks costing nine gigabytes of memory and costing none.
 
 Harmony draws on the gpu where there is one and falls back rather than fails where there is
 not: wgpu first (vulkan or dx12), then opengl.
+
+Rich presence, when it is turned on, says what is actually happening: the sound being
+listened to and the game it is from, the game changing the moment a tab does, and an export
+while one is running — `extracting 12.0k of 122k`, with the percentage beside the game and
+a clock counting the run rather than the session. A sound harmony could not name is shown
+under its container, `zmb_tomb.all/_f6a6b431ac13033b`, rather than as a bare number.
 
 ## sorting
 

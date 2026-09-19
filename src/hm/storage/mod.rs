@@ -99,6 +99,7 @@ impl Default for Settings {
 impl Settings {
     pub fn format(&self) -> Format {
         match self.format.as_str() {
+            "flac" => Format::Flac,
             "ogg" => Format::Ogg,
             "raw" => Format::Raw,
             _ => Format::Wav,

@@ -33,6 +33,10 @@ pub struct Mounted {
     pub keys: usize,
     /// What kind of container this install turned out to use.
     pub container: String,
+    /// The version of the game these packages came out of, where the install
+    /// says: it names the folder a whole library is written into, so two
+    /// patches of the same game do not land on top of each other.
+    pub build: Option<String>,
 }
 
 pub struct State {
@@ -113,6 +117,14 @@ pub struct State {
     pub status: String,
     pub error: Option<String>,
     pub show_queue: bool,
+    /// When the export now running began, so discord counts the run rather
+    /// than the session.
+    pub export_since: Option<i64>,
+    /// When the presence line was last pushed, and whether the last push was
+    /// an export: together they keep a long run moving on discord without
+    /// asking every frame.
+    pub presence_at: i64,
+    pub was_exporting: bool,
     /// Work that stopped because there was not enough room for it, and what
     /// to do again once there is.
     pub blocked: Option<Blocked>,
@@ -266,7 +278,15 @@ pub struct Blocked {
 pub enum Again {
     Cache,
     Extract { all: bool },
+    /// The whole library, into a folder of its own.
+    Library,
     DragOut,
+}
+
+/// What an export says for itself on discord while it runs.
+pub struct Running {
+    pub details: String,
+    pub what: String,
 }
 
 /// A drag of sounds out of harmony and into something else.
@@ -377,6 +397,9 @@ impl State {
             status: "pick a game folder".into(),
             error: None,
             show_queue: false,
+            export_since: None,
+            presence_at: 0,
+            was_exporting: false,
             blocked: None,
             dragging_out: None,
         };
@@ -476,6 +499,9 @@ impl State {
         if !self.title.is_some_and(|id| self.unshelve(id)) {
             self.load_cache();
         }
+        // Whatever this folder turned out to be, discord is told: the tab that
+        // is open is the one the line names.
+        self.push_presence();
     }
 
     /// Put down whatever install was open. Switching games with a catalogue
@@ -554,6 +580,7 @@ impl State {
         match blocked.again {
             Again::Cache => self.save_cache(),
             Again::Extract { all } => self.extract(all),
+            Again::Library => self.extract_library(),
             // A carry is a gesture, not a job: there is nothing to resume, so
             // the way back is to drag the rows again.
             Again::DragOut => self.status = "drag the rows out again".into(),
@@ -574,7 +601,7 @@ impl State {
         };
         match blocked.again {
             Again::Cache => self.set_cache_dir(Some(folder)),
-            Again::Extract { .. } => self.set_output_dir(folder),
+            Again::Extract { .. } | Again::Library => self.set_output_dir(folder),
             Again::DragOut => self.set_temp_dir(Some(folder)),
         }
         // The folder moved, so the work is tried where it now points.
@@ -1411,6 +1438,7 @@ impl State {
         self.pump_names();
         self.pump_naming();
         self.pump_sounding();
+        self.pump_presence();
         self.read_disks();
 
         // The veil comes down once there is nothing left to wait for.
@@ -1494,6 +1522,7 @@ impl State {
                                 mount.store.info().iter().map(|i| i.name.clone()).collect();
                             self.mounted.keys = mount.store.keys();
                             self.mounted.container = mount.store.label().to_string();
+                            self.mounted.build = mount.build.clone();
                             self.mount = Some(Arc::new(Mutex::new(*mount)));
                             self.catalog.scanned_at = Some(storage::stamp());
                             self.dirty = true;
@@ -2127,6 +2156,7 @@ impl State {
             .map(|t| t.key().to_string())
             .unwrap_or_else(|| "unknown".into());
         self.show_queue = true;
+        self.export_since = Some(crate::hm::discord::now_ms());
         self.queue.start(
             mount,
             chosen,
@@ -2137,12 +2167,162 @@ impl State {
         );
     }
 
+    /// What a whole library is written into: `[t7] black ops iii - 1.0.0.2`.
+    ///
+    /// The id first, because that is what harmony keys everything else on and
+    /// what sorts a folder of them into something readable; the name for the
+    /// people who do not think in engine names; the build last, so two versions
+    /// of the same game pulled a year apart do not land on top of each other.
+    /// A game whose build harmony could not read is written without one rather
+    /// than with a guess.
+    pub fn library_folder(&self, build: Option<&str>) -> String {
+        let id = self.title.map(|t| t.key()).unwrap_or("unknown");
+        let name = self.title.map(title_label).unwrap_or("unknown");
+        let stem = match build {
+            Some(build) if !build.trim().is_empty() => {
+                format!("[{id}] {name} - {}", build.trim())
+            }
+            _ => format!("[{id}] {name}"),
+        };
+        crate::hm::export::layout::safe(&stem)
+    }
+
+    /// Extract everything this game has, filter or no filter.
+    ///
+    /// Not the same button as `extract shown` with nothing typed in the search
+    /// box: this one ignores the view entirely, makes a folder of its own named
+    /// after the game and the build it came from, and runs wide — every worker
+    /// the machine can spare — because a library is a hundred thousand sounds
+    /// and an afternoon, not a handful.
+    pub fn extract_library(&mut self) {
+        let Some(mount) = self.mount.clone() else {
+            self.error = Some("nothing mounted".into());
+            return;
+        };
+        if self.catalog.is_empty() {
+            self.error = Some("nothing to extract".into());
+            return;
+        }
+        let into = match self.output.clone() {
+            Some(root) => root,
+            None => match rfd::FileDialog::new().pick_folder() {
+                Some(folder) => {
+                    self.output = Some(folder.clone());
+                    self.settings.output = Some(folder.clone());
+                    storage::save(&self.settings);
+                    folder
+                }
+                None => return,
+            },
+        };
+        let build = mount.lock().ok().and_then(|lock| lock.build.clone());
+        let root = into.join(self.library_folder(build.as_deref()));
+
+        let chosen: Vec<Entry> = self.catalog.entries.clone();
+        let want = crate::hm::export::estimate(&chosen, self.options.format);
+        if let Some(room) = space::shortfall(&into, want) {
+            self.blocked = Some(Blocked {
+                what: format!("extract {} sounds", ui::widgets::tally(chosen.len())),
+                room,
+                again: Again::Library,
+            });
+            self.status = "not enough room to extract".into();
+            return;
+        }
+        self.blocked = None;
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            self.error = Some(error.to_string());
+            return;
+        }
+        let game = self
+            .title
+            .map(|t| t.key().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        self.show_queue = true;
+        self.export_since = Some(crate::hm::discord::now_ms());
+        self.status = format!(
+            "extracting {} sounds into {}",
+            ui::widgets::tally(chosen.len()),
+            self.library_folder(build.as_deref())
+        );
+        self.queue.start(
+            mount,
+            chosen,
+            self.mounted.packages.clone(),
+            game,
+            root,
+            self.options.clone(),
+        );
+    }
+
+    /// What the presence line says while an export is running, or nothing when
+    /// none is.
+    ///
+    /// Read off the queue under its lock and let go of straight away: the
+    /// workers are writing into the same struct.
+    pub fn exporting(&self) -> Option<Running> {
+        let progress = self.queue.progress.lock().ok()?;
+        if !progress.running || progress.total == 0 {
+            return None;
+        }
+        let through = progress.done + progress.failed;
+        let percent = (through as f32 / progress.total as f32 * 100.0).round() as u32;
+        Some(Running {
+            details: format!(
+                "extracting {} of {}",
+                crate::hm::discord::compact(through),
+                crate::hm::discord::compact(progress.total)
+            ),
+            what: match self.queue.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                true => format!("export paused at {percent}%"),
+                false => format!("exporting {percent}%"),
+            },
+        })
+    }
+
+    /// Keep the presence line in step with a running export.
+    ///
+    /// The line only moves in whole percents, and discord will not take more
+    /// than one update every few seconds anyway, so this asks no more often
+    /// than the answer can change.
+    fn pump_presence(&mut self) {
+        let running = self
+            .queue
+            .progress
+            .lock()
+            .map(|progress| progress.running)
+            .unwrap_or(false);
+        if !running && !self.was_exporting {
+            return;
+        }
+        let now = crate::hm::discord::now_ms();
+        if running && now - self.presence_at < 2000 {
+            return;
+        }
+        self.presence_at = now;
+        // The run that just ended puts the ordinary line back.
+        self.was_exporting = running;
+        self.push_presence();
+    }
+
     pub fn push_presence(&mut self) {
         if !self.settings.discord {
             self.rpc.clear();
             return;
         }
         let game = self.title.map(presence_name).unwrap_or("no game").to_string();
+        // An export is the loudest thing harmony can be doing, and the one
+        // worth saying out loud: it runs for hours and the person watching
+        // wants to know how far along it is without opening the window.
+        if let Some(run) = self.exporting() {
+            self.rpc.set(Presence {
+                details: crate::hm::discord::clip(&run.details, 60),
+                state: crate::hm::discord::clip(&format!("{game} \u{b7} {}", run.what), 60),
+                large_text: "harmony".into(),
+                since: self.export_since.or(Some(self.started)),
+            });
+            return;
+        }
         // What is being listened to, or how much there is if nothing is.
         let details = match self.cursor.and_then(|i| self.catalog.entries.get(i)) {
             // A hash alone says nothing to anyone reading it, so the container

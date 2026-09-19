@@ -124,7 +124,7 @@ fn stalled(ctx: &egui::Context, state: &mut State) {
 fn folder_word(again: Again) -> &'static str {
     match again {
         Again::Cache => "cache somewhere else",
-        Again::Extract { .. } => "extract somewhere else",
+        Again::Extract { .. } | Again::Library => "extract somewhere else",
         Again::DragOut => "scratch somewhere else",
     }
 }
