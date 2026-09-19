@@ -1,6 +1,8 @@
 pub mod analysis;
 pub mod app;
 pub mod catalog;
+pub mod console;
+pub mod crash;
 pub mod discord;
 pub mod export;
 pub mod game;

@@ -240,3 +240,58 @@ pub fn field_note(ui: &mut Ui, name: &str, value: &str, note: &str, colour: egui
         }
     });
 }
+
+/// The star beside a sound somebody starred.
+///
+/// It breathes rather than sits: a favourite is something the eye should find
+/// while scrolling a list of a hundred thousand names, and a shape that moves
+/// a little is found without being loud about it. The phase comes from the row
+/// itself, so a screenful of them is a field of slow lights rather than one
+/// blinking thing repeated.
+///
+/// Drawn as a pentagon with five triangles on it. A five-pointed star is not
+/// convex, and egui fills convex shapes: cut this way every piece is.
+pub fn star(ui: &mut Ui, side: f32, colour: Color32, phase: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
+    let time = ui.input(|input| input.time) as f32;
+    // Slow enough to read as breathing rather than as flashing.
+    let beat = ((time * 1.8 + phase).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+    let spin = (time * 0.35 + phase * 0.3).sin() * 0.12;
+    let outer = side * 0.5 * (0.78 + 0.12 * beat);
+    let inner = outer * 0.46;
+    let middle = rect.center();
+    let lit = colour.gamma_multiply(0.72 + 0.28 * beat);
+
+    let point = |turn: f32, radius: f32| {
+        let angle = std::f32::consts::TAU * turn - std::f32::consts::FRAC_PI_2 + spin;
+        pos2(
+            middle.x + radius * angle.cos(),
+            middle.y + radius * angle.sin(),
+        )
+    };
+    let tips: Vec<egui::Pos2> = (0..5).map(|i| point(i as f32 / 5.0, outer)).collect();
+    let pits: Vec<egui::Pos2> = (0..5)
+        .map(|i| point((i as f32 + 0.5) / 5.0, inner))
+        .collect();
+
+    let painter = ui.painter_at(rect);
+    painter.add(egui::Shape::convex_polygon(
+        pits.clone(),
+        lit,
+        Stroke::NONE,
+    ));
+    for (at, tip) in tips.iter().enumerate() {
+        let left = pits[(at + 4) % 5];
+        let right = pits[at];
+        painter.add(egui::Shape::convex_polygon(
+            vec![left, *tip, right],
+            lit,
+            Stroke::NONE,
+        ));
+    }
+    // Something is moving, so the window has to be asked for the next frame:
+    // nothing else here would.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+    response
+}

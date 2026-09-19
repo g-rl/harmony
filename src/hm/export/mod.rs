@@ -1,5 +1,6 @@
 pub mod drag;
 pub mod flac;
+pub mod lanes;
 pub mod layout;
 pub mod liblog;
 pub mod manifest;

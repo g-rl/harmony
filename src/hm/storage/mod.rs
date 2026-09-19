@@ -47,6 +47,10 @@ pub struct Settings {
     /// The size the window was left at.
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
+    /// Where the console was left: x, y, width, height. It is a window of its
+    /// own, and one somebody has dragged out of the way should stay there.
+    #[serde(default)]
+    pub console_rect: Option<[f32; 4]>,
     /// Where scan caches are written. A catalogue of a big install runs to tens
     /// of megabytes, so it does not have to live on the system disk.
     #[serde(default)]
@@ -96,6 +100,7 @@ impl Default for Settings {
             presets: HashMap::new(),
             roots: HashMap::new(),
             window_size: None,
+            console_rect: None,
             cache_dir: None,
             temp_dir: None,
         }
@@ -394,6 +399,64 @@ fn local_now() -> Option<String> {
         "{:04}-{:02}-{:02} {:02}:{:02}",
         now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute
     ))
+}
+
+/// The clock alone, to the second: what the console puts in front of a line.
+pub fn clock() -> String {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::GetLocalTime;
+        let now = unsafe { GetLocalTime() };
+        return format!("{:02}:{:02}:{:02}", now.wHour, now.wMinute, now.wSecond);
+    }
+    #[cfg(not(windows))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let rest = seconds % 86_400;
+        format!(
+            "{:02}:{:02}:{:02}",
+            rest / 3600,
+            (rest % 3600) / 60,
+            rest % 60
+        )
+    }
+}
+
+/// The moment now, spelled so it can be a file name: `2026-09-16-15-36-16`.
+///
+/// The same shape the games themselves use for a crash folder, because that is
+/// the shape somebody comparing the two already reads.
+pub fn file_stamp() -> String {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::GetLocalTime;
+        let now = unsafe { GetLocalTime() };
+        return format!(
+            "{:04}-{:02}-{:02}-{:02}-{:02}-{:02}",
+            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let days = seconds / 86_400;
+        let rest = seconds % 86_400;
+        let (year, month, day) = civil(days as i64);
+        format!(
+            "{year:04}-{month:02}-{day:02}-{:02}-{:02}-{:02}",
+            rest / 3600,
+            (rest % 3600) / 60,
+            rest % 60
+        )
+    }
 }
 
 fn civil(days: i64) -> (i64, u32, u32) {

@@ -11,7 +11,8 @@ use crate::hm::catalog::hash::HashFn;
 use crate::hm::catalog::names::NameDb;
 use crate::hm::catalog::{Catalog, Entry, Name, SoundId, category::Category, group};
 use crate::hm::discord::{Presence, Rpc};
-use crate::hm::export::{Options, queue::Queue};
+use crate::hm::console::{self, Channel};
+use crate::hm::export::{Options, lanes::Lanes};
 use crate::hm::game::{Fingerprint, Mount, Support, TitleId, detect, title_for};
 use crate::hm::query::{Query, eval, parse};
 use crate::hm::scan::{self, Depth};
@@ -110,7 +111,23 @@ pub struct State {
     pub filtered_at: std::time::Instant,
 
     pub transport: Option<crate::hm::player::Transport>,
-    pub queue: Queue,
+    /// The export lanes. Lane one is the queue harmony has always had, and
+    /// everything lands there unless a split view is asked for; `Lanes` reads
+    /// as that one queue wherever nothing else is said.
+    pub queue: Lanes,
+    /// The next export opens a lane of its own instead of joining the line.
+    pub split_next: bool,
+    /// Which lane windows are on screen, and which one was looked at last.
+    pub lane_focus: usize,
+    /// The console, its scrollback filters and the line being typed.
+    pub console: ui::console::Console,
+    /// When the crash reporter was last told what harmony is doing.
+    pub told_crash: std::time::Instant,
+    /// Something asked harmony to close: the console, or a shortcut.
+    pub wants_close: bool,
+    /// Whether anything was being written last time the window looked, so the
+    /// put-down notes are read again the moment the lanes fall quiet.
+    pub exports_were: bool,
     pub options: Options,
     pub output: Option<PathBuf>,
 
@@ -425,7 +442,13 @@ impl State {
             dirty: false,
             filtered_at: std::time::Instant::now(),
             transport: crate::hm::player::Transport::open().ok(),
-            queue: Queue::default(),
+            queue: Lanes::default(),
+            split_next: false,
+            lane_focus: 1,
+            console: ui::console::Console::default(),
+            told_crash: std::time::Instant::now(),
+            wants_close: false,
+            exports_were: false,
             options,
             status: "pick a game folder".into(),
             error: None,
@@ -462,6 +485,44 @@ impl State {
             state.booting = true;
             state.look(root);
         }
+
+        // What harmony came back to. An export that was going when the window
+        // last closed - or when it was killed, or the machine went - left a
+        // note behind, and the first thing the console says is that it is
+        // still there to be picked up.
+        console::note(
+            Channel::App,
+            crate::hm::console::Level::Good,
+            "harmony is up",
+            format!("{} threads", crate::hm::export::queue::Queue::workers()),
+        );
+        if !state.resumes.is_empty() {
+            console::deep(
+                Channel::Export,
+                crate::hm::console::Level::Warn,
+                format!(
+                    "{} exports were left half done and can be picked up",
+                    state.resumes.len()
+                ),
+                state
+                    .resumes
+                    .iter()
+                    .map(|note| {
+                        format!(
+                            "{} - {} of {} written, stopped {}",
+                            note.folder, note.done, note.total, note.at
+                        )
+                    })
+                    .collect(),
+            );
+            state.status = format!(
+                "{} exports can be picked up where they stopped",
+                ui::widgets::tally(state.resumes.len())
+            );
+        }
+        // Old crash reports are thrown away as new ones arrive, but a run that
+        // never crashes again should not keep twenty of them for ever either.
+        crate::hm::crash::prune(crate::hm::crash::KEEP);
         state
     }
 
@@ -535,6 +596,25 @@ impl State {
             (None, None) => "nothing harmony reads is in that folder".into(),
         };
         storage::save(&self.settings);
+        console::deep(
+            Channel::Game,
+            match self.detected.is_empty() {
+                true => crate::hm::console::Level::Warn,
+                false => crate::hm::console::Level::Good,
+            },
+            self.status.clone(),
+            self.detected
+                .iter()
+                .map(|print| {
+                    format!(
+                        "{:<5}{:<10}score {}",
+                        print.title.key(),
+                        print.title.abbr(),
+                        print.score
+                    )
+                })
+                .collect(),
+        );
         // A game read out of this same folder a moment ago is still in hand.
         if !self.title.is_some_and(|id| self.unshelve(id)) {
             self.load_cache();
@@ -748,6 +828,7 @@ impl State {
         if self.title == Some(id) {
             return;
         }
+        console::info(Channel::Game, format!("opening {}", title_label(id)));
         // Already in the folder that is open: only the view changes, and the
         // catalogue comes back from this game's own cache.
         if self.detected.iter().any(|print| print.title == id) {
@@ -931,6 +1012,15 @@ impl State {
                 0 => "no names matched these sounds".to_string(),
                 found => format!("{} names matched", ui::widgets::tally(found)),
             };
+            console::note(
+                Channel::Names,
+                match found {
+                    0 => crate::hm::console::Level::Warn,
+                    _ => crate::hm::console::Level::Good,
+                },
+                self.status.clone(),
+                format!("{} in the list", self.names.len()),
+            );
             // Keep them: a matched name in the cache is a name the next run
             // does not have to look up again.
             if found > 0 {
@@ -1001,6 +1091,12 @@ impl State {
         };
         self.blocked = None;
         self.status = "caching the scan".into();
+        console::note(
+            Channel::Scan,
+            crate::hm::console::Level::Info,
+            format!("caching {} sounds", cache.sounds.len()),
+            storage::cache_dir().to_string_lossy().to_ascii_lowercase(),
+        );
         std::thread::spawn(move || {
             let _ = storage::save_cache(&cache);
         });
@@ -1226,6 +1322,12 @@ impl State {
             self.status = "that game is already being scanned".into();
             return;
         }
+        console::note(
+            Channel::Scan,
+            crate::hm::console::Level::Info,
+            format!("scanning {}", title_label(id)),
+            format!("{} deep", self.depth.label()),
+        );
         // A mount started for the cached catalogue is about to be redone by the
         // scan itself, so it can go, and whatever was kept of this game is
         // about to be out of date.
@@ -1414,12 +1516,18 @@ impl State {
             });
         }
         {
-            let queue = self.queue.progress.lock().unwrap();
-            if queue.running {
+            // Every lane at once: two exports running side by side are one
+            // number along the bottom, not a fight over the line.
+            let (done, failed, total, _) = self.queue.totals();
+            if total > 0 {
+                let lanes = match self.queue.lines().len() {
+                    0 | 1 => String::new(),
+                    many => format!(" in {many} lanes"),
+                };
                 parts.push(format!(
-                    "extracting {} of {}",
-                    ui::widgets::tally(queue.done + queue.failed),
-                    ui::widgets::tally(queue.total)
+                    "extracting {} of {}{lanes}",
+                    ui::widgets::tally(done + failed),
+                    ui::widgets::tally(total)
                 ));
             }
         }
@@ -2248,23 +2356,34 @@ impl State {
             self.title.map(|id| id.abbr()).unwrap_or("unknown"),
             ui::widgets::tally(chosen.len())
         );
-        let now = self.queue.submit(crate::hm::export::queue::Run {
-            id: crate::hm::export::queue::next_id(),
-            label: label.clone(),
-            mount,
-            entries: chosen,
-            packages: self.mounted.packages.clone(),
-            game,
-            root,
-            options: self.options.clone(),
-            log: None,
-            // A run of the selection owns no folder of its own, so there is
-            // nothing to pick it up from: it is small enough to run again.
-            resume: None,
-        });
-        if !now {
-            self.status = format!("{label} queued behind the export already running");
-        }
+        // A split sends it to a lane of its own, running beside whatever else
+        // is going; without one it joins the line, where it waits its turn
+        // rather than throwing away the run in front of it.
+        let split = std::mem::take(&mut self.split_next);
+        let sent = self.queue.send(
+            crate::hm::export::queue::Run {
+                id: crate::hm::export::queue::next_id(),
+                label: label.clone(),
+                mount,
+                entries: chosen,
+                packages: self.mounted.packages.clone(),
+                game,
+                root,
+                options: self.options.clone(),
+                log: None,
+                // A run of the selection owns no folder of its own, so there
+                // is nothing to pick it up from: it is small enough to run
+                // again.
+                resume: None,
+            },
+            split,
+        );
+        self.lane_focus = sent.lane;
+        self.status = match (sent.started, sent.lane) {
+            (true, 1) => format!("extracting {label}"),
+            (true, lane) => format!("{label} started in lane {lane}"),
+            (false, lane) => format!("{label} is waiting its turn in lane {lane}"),
+        };
     }
 
     /// What a whole library is written into: `[t7] black ops iii - 1.0.0.2`.
@@ -2414,14 +2533,9 @@ impl State {
     /// can simply be run again, an export is hours of writing that should be
     /// picked up rather than started over.
     pub fn busy(&self) -> Busy {
-        let (running, done, failed, total, queued) = self
-            .queue
-            .progress
-            .lock()
-            .map(|p| (p.running, p.done, p.failed, p.total, p.waiting.len()))
-            .unwrap_or((false, 0, 0, 0, 0));
+        let (done, failed, total, queued) = self.queue.totals();
         Busy {
-            exporting: running.then_some((done + failed, total)),
+            exporting: (total > 0).then_some((done + failed, total)),
             queued,
             scanning: !self.jobs.is_empty() || self.loading.is_some(),
             naming: self.naming.is_some(),
@@ -2435,11 +2549,7 @@ impl State {
     /// throw away what it has already written.
     /// Can the run that is going be put down and picked up later?
     pub fn resumable(&self) -> bool {
-        self.queue
-            .progress
-            .lock()
-            .map(|lock| lock.resume.is_some())
-            .unwrap_or(false)
+        self.queue.resumable()
     }
 
     pub fn ask_close(&mut self, ctx: &egui::Context) {
@@ -2460,37 +2570,16 @@ impl State {
     /// folder on disk is that list, and `skip existing` steps over every one
     /// of them when the run comes back.
     pub fn pause_and_save(&mut self) {
-        let (note, done, failed, total) = {
-            let Ok(lock) = self.queue.progress.lock() else {
-                return;
-            };
-            (lock.resume.clone(), lock.done, lock.failed, lock.total)
-        };
-        let mut put_down: Vec<storage::Resume> = Vec::new();
-
-        // The run that is going, with how far it actually got. A run of the
-        // selection has no note of its own — it owns no folder, so there is
-        // nothing to pick it up from — and is simply stopped.
-        if let Some(resume) = note {
-            let resume = storage::Resume {
-                done,
-                failed,
-                total,
-                at: storage::stamp(),
-                ..resume
-            };
-            storage::save_resume(&resume);
-            put_down.push(resume);
+        // Every lane, and in each of them the run that is going with how far
+        // it actually got, then everything still behind it.
+        let put_down = self.queue.all_notes();
+        for resume in &put_down {
+            storage::save_resume(resume);
         }
-        // And everything still waiting, which has got nowhere yet.
-        for resume in self.queue.notes() {
-            let resume = storage::Resume {
-                at: storage::stamp(),
-                ..resume
-            };
-            storage::save_resume(&resume);
-            put_down.push(resume);
-        }
+        console::info(
+            Channel::Export,
+            format!("{} exports put down and written to disk", put_down.len()),
+        );
 
         self.queue.stop_all();
         if put_down.is_empty() {
@@ -2564,33 +2653,70 @@ impl State {
     /// A run that was cancelled does not: it is exactly the one somebody comes
     /// back to.
     fn pump_resume(&mut self) {
-        if !self.resuming {
+        let running = self.queue.any_running();
+        if running {
+            self.exports_were = true;
             return;
         }
-        let (running, done, failed, total, note) = {
-            let Ok(lock) = self.queue.progress.lock() else {
-                return;
-            };
-            (
-                lock.running,
-                lock.done,
-                lock.failed,
-                lock.total,
-                lock.resume.clone(),
-            )
-        };
-        if running || total == 0 {
+        if !self.exports_were {
             return;
         }
+        // The lanes have gone quiet. The queue writes and clears these notes
+        // itself - at every checkpoint, and at the end of every run, whether
+        // or not harmony was closed politely - so the window has only to read
+        // the folder again rather than work out what happened.
+        self.exports_were = false;
         self.resuming = false;
-        if done + failed >= total
-            && let Some(note) = note
-        {
-            storage::clear_resume(&note);
-            self.resumes
-                .retain(|other| other.file_name() != note.file_name());
-            self.status = format!("export finished: {done} written, {failed} failed");
+        self.resumes = storage::load_resumes();
+        self.status = match self.resumes.is_empty() {
+            true => "exports finished".into(),
+            false => format!(
+                "exports finished; {} can still be picked up",
+                ui::widgets::tally(self.resumes.len())
+            ),
+        };
+    }
+
+    /// Tell the crash reporter what harmony is doing, so a report has
+    /// something to say beyond a line number.
+    ///
+    /// Cheap, flat and no more than once a second: it is read by a process on
+    /// its way out, which will not wait for anything clever.
+    pub fn tell_crash(&mut self, now: bool) {
+        if !now && self.told_crash.elapsed() < std::time::Duration::from_secs(1) {
+            return;
         }
+        self.told_crash = std::time::Instant::now();
+        crate::hm::crash::doing(crate::hm::crash::Doing {
+            game: self.title.map(|id| id.key().to_string()).unwrap_or_default(),
+            build: self.mounted.build.clone().unwrap_or_default(),
+            root: self
+                .root
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default(),
+            sounds: self.catalog.len(),
+            shown: self.filtered.len(),
+            picked: self.selection.len(),
+            names: self.names.len(),
+            output: self
+                .output
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default(),
+            scanning: self.scanning(),
+            lanes: self.queue.lines(),
+            notes: self
+                .resumes
+                .iter()
+                .map(|note| {
+                    format!(
+                        "{} - {} of {} written ({})",
+                        note.folder, note.done, note.total, note.at
+                    )
+                })
+                .collect(),
+        });
     }
 
     /// Extract everything this game has, filter or no filter.
@@ -2743,21 +2869,28 @@ impl State {
             total: chosen.len(),
             at: storage::stamp(),
         };
-        let now = self.queue.submit(crate::hm::export::queue::Run {
-            id: crate::hm::export::queue::next_id(),
-            label: label.clone(),
-            mount,
-            entries: chosen,
-            packages: self.mounted.packages.clone(),
-            game,
-            root,
-            options: self.options.clone(),
-            log: Some(log),
-            resume: Some(note),
-        });
-        self.status = match now {
-            true => format!("extracting into {folder}"),
-            false => format!("{label} queued behind the export already running"),
+        let split = std::mem::take(&mut self.split_next);
+        let sent = self.queue.send(
+            crate::hm::export::queue::Run {
+                id: crate::hm::export::queue::next_id(),
+                label: label.clone(),
+                mount,
+                entries: chosen,
+                packages: self.mounted.packages.clone(),
+                game,
+                root,
+                options: self.options.clone(),
+                log: Some(log),
+                resume: Some(note),
+            },
+            split,
+        );
+        self.lane_focus = sent.lane;
+        self.resumes = storage::load_resumes();
+        self.status = match (sent.started, sent.lane) {
+            (true, 1) => format!("extracting into {folder}"),
+            (true, lane) => format!("extracting into {folder} in lane {lane}"),
+            (false, lane) => format!("{label} is waiting its turn in lane {lane}"),
         };
     }
 
@@ -2767,7 +2900,11 @@ impl State {
     /// Read off the queue under its lock and let go of straight away: the
     /// workers are writing into the same struct.
     pub fn exporting(&self) -> Option<Running> {
-        let progress = self.queue.progress.lock().ok()?;
+        // Whichever lane has the most left to do: two exports running side by
+        // side are one line on discord, and the long one is the one being
+        // waited on.
+        let lane = self.queue.loudest()?;
+        let progress = lane.queue.progress.lock().ok()?;
         if !progress.running || progress.total == 0 {
             return None;
         }
@@ -2779,7 +2916,11 @@ impl State {
                 crate::hm::discord::compact(through),
                 crate::hm::discord::compact(progress.total)
             ),
-            what: match self.queue.paused.load(std::sync::atomic::Ordering::Relaxed) {
+            what: match lane
+                .queue
+                .paused
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 true => format!("export paused at {percent}%"),
                 false => format!("exporting {percent}%"),
             },
@@ -2792,12 +2933,7 @@ impl State {
     /// than one update every few seconds anyway, so this asks no more often
     /// than the answer can change.
     fn pump_presence(&mut self) {
-        let running = self
-            .queue
-            .progress
-            .lock()
-            .map(|progress| progress.running)
-            .unwrap_or(false);
+        let running = self.queue.any_running();
         if !running && !self.was_exporting {
             return;
         }
@@ -3070,6 +3206,11 @@ impl eframe::App for Harmony {
             self.state.closing = true;
         }
         self.state.pump();
+        // What a crash report would say, kept a second old at most.
+        self.state.tell_crash(false);
+        if std::mem::take(&mut self.state.wants_close) {
+            self.state.ask_close(&ctx);
+        }
         // Filtering and regrouping happen here, once, rather than every time a
         // batch of a running scan lands.
         self.state.settle();
@@ -3111,15 +3252,19 @@ impl eframe::App for Harmony {
             .frame(side_frame())
             .show(root, |ui| ui::browser::show(ui, &mut self.state));
 
-        if self.state.show_queue {
-            ui::queue::window(&ctx, &mut self.state);
-            ui::closing::window(&ctx, &mut self.state);
-        }
+        // Every lane that has a window open; lane one is the one the export
+        // panel opens, and the rest are splits.
+        ui::queue::window(&ctx, &mut self.state);
+        ui::closing::window(&ctx, &mut self.state);
 
         // Anything stopped for want of disk room says so over everything else.
         ui::space::window(&ctx, &mut self.state);
 
         ui::dragout::card(&ctx, &mut self.state);
+
+        // Over the lot, under the veil: everything harmony has been doing, and
+        // the prompt to tell it to do more.
+        ui::console::window(&ctx, &mut self.state);
 
         // Over everything, while the last folder and its cache are still being
         // read on their threads.
@@ -3133,7 +3278,7 @@ impl eframe::App for Harmony {
         let working = self.state.scanning()
             || self.state.loading.is_some()
             || self.state.looking.is_some()
-            || self.state.queue.progress.lock().unwrap().running;
+            || self.state.queue.any_running();
         if working {
             // Often enough to look alive, rarely enough to leave the disk and
             // the worker threads the machine they are busy with.
@@ -3184,7 +3329,29 @@ fn status(ui: &mut egui::Ui, state: &mut State) {
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-
+            // The console, and whether anything has gone wrong in it since it
+            // was last looked at. Tilde opens it from anywhere; this is for
+            // the people who have not found that out yet.
+            let unread = console::unread();
+            let hit = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(match unread {
+                        0 => "~ console".to_string(),
+                        many => format!("~ console ({many})"),
+                    })
+                    .color(match unread {
+                        0 => theme::DIM,
+                        _ => theme::UNLIT,
+                    }),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if hit
+                .on_hover_text("everything harmony has been doing, and a prompt to tell it more")
+                .clicked()
+            {
+                state.console.toggle();
+            }
             if state.rpc.is_linked() {
                 ui.colored_label(theme::GOOD, "discord");
             }
@@ -3203,6 +3370,31 @@ fn status(ui: &mut egui::Ui, state: &mut State) {
 }
 
 fn keys(ctx: &egui::Context, state: &mut State) {
+    // The tilde, wherever the caret is: the console is opened from the middle
+    // of typing a search as often as from nothing at all. It is taken out of
+    // the input queue so the character never reaches the line being edited.
+    let tilde = ctx.input_mut(|input| {
+        let hit = input.consume_key(egui::Modifiers::NONE, egui::Key::Backtick)
+            || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Backtick);
+        if hit {
+            // The key event is not the whole of it: the character arrives
+            // separately, and without this it lands in whatever was being
+            // typed the moment the console opens over it.
+            input.events.retain(|event| {
+                !matches!(event, egui::Event::Text(text) if text == "`" || text == "~")
+            });
+        }
+        hit
+    });
+    if tilde {
+        state.console.toggle();
+        return;
+    }
+    // While it is open, the console has the keyboard: space is a space, not
+    // the player.
+    if state.console.open {
+        return;
+    }
     let wants = ctx.input(|i| {
         (
             i.key_pressed(egui::Key::Space),

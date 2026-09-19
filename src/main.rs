@@ -102,6 +102,10 @@ fn main() -> eframe::Result<()> {
     // Headless runs write the same caches the window reads, so they follow the
     // same folder settings.
     hm::storage::use_folders(&hm::storage::load());
+    // The log first, then the hook that writes what is in it down when
+    // something falls over.
+    hm::console::boot();
+    hm::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(root) = args.iter().position(|a| a == "--probe").and_then(|i| args.get(i + 1)) {
         probe(std::path::Path::new(root));
@@ -126,6 +130,7 @@ fn main() -> eframe::Result<()> {
             std::path::Path::new(root),
             count.parse().unwrap_or(8),
             std::path::Path::new(out),
+            args.iter().any(|a| a == "split"),
         );
         return Ok(());
     }
@@ -143,6 +148,27 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         };
         casc(std::path::Path::new(root), args.get(at + 2).map(String::as_str));
+        return Ok(());
+    }
+    // Write a crash report without crashing, to see what one says.
+    if args.iter().any(|a| a == "--crash-report") {
+        hm::console::info(hm::console::Channel::App, "a headless run, for the report below");
+        hm::console::deep(
+            hm::console::Channel::Export,
+            hm::console::Level::Warn,
+            "an export that was going when this was written",
+            vec!["lane 1: t7 - 400 of 27,605 written".into()],
+        );
+        // `--crash-report panic` proves the hook itself, rather than the
+        // report writer: it falls over on purpose and the report is written
+        // by the panic hook on the way out.
+        if args.iter().any(|a| a == "panic") {
+            panic!("a panic asked for on the command line");
+        }
+        match hm::crash::dump("asked for on the command line") {
+            Some(path) => println!("{}", path.display()),
+            None => println!("the report could not be written"),
+        }
         return Ok(());
     }
     if let Some(at) = args.iter().position(|a| a == "--room") {
@@ -1060,7 +1086,8 @@ fn stream(path: &std::path::Path) {
 
 /// Headless check: scan, then extract the first `count` sounds both ways and
 /// say what landed where.
-fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
+fn pull(root: &std::path::Path, count: usize, out: &std::path::Path, split: bool) {
+    use hm::export::lanes::Lanes;
     use hm::export::{Options, queue::Queue};
     use hm::game::{detect, title_for};
     use hm::scan::{self, Depth, Msg};
@@ -1118,10 +1145,11 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
         .map(|info| info.name.clone())
         .collect();
 
-    // One queue, four runs, sent one after another without waiting: exactly
-    // what the window does when a second export is asked for while one is
-    // going. The line runs them in the order they were sent.
-    let queue = Queue::default();
+    // Four runs sent one after another without waiting: exactly what the
+    // window does when a second export is asked for while one is going. In a
+    // line they run in the order they were sent; split, each one opens a lane
+    // of its own and they run side by side, sharing the threads out.
+    let mut queue = Lanes::default();
     for format in hm::export::FORMATS.iter().copied() {
         let mut options = Options::default();
         options.format = format;
@@ -1136,49 +1164,67 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
         log.say(format!("format    {}", format.label()));
         log.say(format!("sounds    {}", entries.len()));
         log.blank();
-        let started = queue.submit(hm::export::queue::Run {
-            id: hm::export::queue::next_id(),
-            label: format!("{} \u{b7} {} sounds", format.label(), entries.len()),
-            mount: mount.clone(),
-            entries: entries.clone(),
-            packages: packages.clone(),
-            game: "jup".into(),
-            root: folder,
-            options,
-            log: Some(log),
-            resume: None,
-        });
+        // A note of its own, so the run can be picked up if this falls over
+        // half way: the queue writes it as the run starts, keeps it up to
+        // date, and clears it only when the run reaches the end.
+        let note = hm::storage::Resume {
+            game: "pull".into(),
+            label: format!("headless pull, {}", format.label()),
+            root: root.to_path_buf(),
+            into: out.to_path_buf(),
+            folder: format.label().to_string(),
+            format: format.label().to_string(),
+            layout: options.layout.label().to_string(),
+            normalise_names: options.normalise_names,
+            write_manifest: options.write_manifest,
+            skip: Vec::new(),
+            done: 0,
+            failed: 0,
+            total: entries.len(),
+            at: hm::storage::stamp(),
+        };
+        let sent = queue.send(
+            hm::export::queue::Run {
+                id: hm::export::queue::next_id(),
+                label: format!("{} \u{b7} {} sounds", format.label(), entries.len()),
+                mount: mount.clone(),
+                entries: entries.clone(),
+                packages: packages.clone(),
+                game: "pull".into(),
+                root: folder,
+                options,
+                log: Some(log),
+                resume: Some(note),
+            },
+            split,
+        );
         println!(
-            "{}: {}",
+            "{}: lane {} {}",
             format.label(),
-            match started {
+            sent.lane,
+            match sent.started {
                 true => "running",
                 false => "queued",
             }
         );
     }
+    println!(
+        "{} lanes, {} threads each",
+        queue.count(),
+        Queue::workers()
+    );
 
-    // Wait for the whole line, saying what is going and what is behind it.
+    // Wait for every lane, saying what each of them is doing.
     let mut said = String::new();
     loop {
-        let (running, waiting, label, done, failed, total) = {
-            let progress = queue.progress.lock().unwrap();
-            (
-                progress.running,
-                progress.waiting.len(),
-                progress.label.clone(),
-                progress.done,
-                progress.failed,
-                progress.total,
-            )
-        };
-        if !running && waiting == 0 {
-            break;
-        }
-        let now = format!("{label}: {done} written, {failed} failed of {total}, {waiting} waiting");
+        let lines: Vec<String> = queue.list().iter().map(|lane| lane.line()).collect();
+        let now = lines.join("  |  ");
         if now != said {
             println!("{now}");
             said = now;
+        }
+        if !queue.any_running() {
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
@@ -1196,6 +1242,20 @@ fn pull(root: &std::path::Path, count: usize, out: &std::path::Path) {
             .unwrap_or(0);
         println!("{}: {written} at the top of {}", format.label(), folder.display());
     }
+    // Nothing should be left behind: a run that reached the end clears its
+    // own note, and one that did not is exactly what should still be there.
+    let left: Vec<String> = hm::storage::load_resumes()
+        .into_iter()
+        .filter(|note| note.game == "pull")
+        .map(|note| format!("{} - {} of {} written", note.folder, note.done, note.total))
+        .collect();
+    println!(
+        "resume notes left: {}",
+        match left.is_empty() {
+            true => "none".to_string(),
+            false => left.join(", "),
+        }
+    );
     println!("output under {}", out.display());
 }
 

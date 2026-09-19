@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::hm::catalog::{Entry, Source};
+use crate::hm::console::{self, Channel, Level};
 use crate::hm::export::{Format, Options, flac, layout, liblog, manifest, ogg, wav};
 use crate::hm::game::Mount;
 use crate::hm::sound::{decode, opus};
@@ -78,6 +79,16 @@ pub struct Progress {
     /// ran out of room. The work is paused, not abandoned: clearing this and
     /// unpausing carries on from the file it stopped at.
     pub stalled: Option<Stall>,
+    /// How long the run that has just ended took.
+    ///
+    /// While a run is going this is empty and the clock is read off `started`.
+    /// The moment it ends the time is written here and stops moving, because
+    /// "took 22m 54s" should be what it took rather than a stopwatch nobody
+    /// remembered to stop.
+    pub spent: Option<f32>,
+    /// Which lane this belongs to: 1 is the queue that has always been there,
+    /// and a split view opens 2, 3 and so on beside it.
+    pub lane: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +139,13 @@ pub struct Waiting {
 
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
+/// How many lanes are open.
+///
+/// Two lanes writing at once are still one machine, one disk and one window,
+/// so what each of them takes is divided by this rather than every lane asking
+/// for everything there is.
+pub static LANES: AtomicUsize = AtomicUsize::new(1);
+
 pub fn next_id() -> u64 {
     NEXT_RUN.fetch_add(1, Ordering::Relaxed)
 }
@@ -146,6 +164,8 @@ pub struct Queue {
     driving: Arc<Mutex<bool>>,
     /// Stop after the run that is going, rather than starting the next.
     pub hold: Arc<AtomicBool>,
+    /// Which lane this queue is: 1 unless a split view opened it.
+    pub lane: usize,
 }
 
 impl Default for Queue {
@@ -157,7 +177,22 @@ impl Default for Queue {
             pending: Arc::new(Mutex::new(VecDeque::new())),
             driving: Arc::new(Mutex::new(false)),
             hold: Arc::new(AtomicBool::new(false)),
+            lane: 1,
         }
+    }
+}
+
+impl Queue {
+    /// A queue that knows which lane it is, for the window title and the log.
+    pub fn in_lane(lane: usize) -> Queue {
+        let queue = Queue {
+            lane,
+            ..Queue::default()
+        };
+        if let Ok(mut lock) = queue.progress.lock() {
+            lock.lane = lane;
+        }
+        queue
     }
 }
 
@@ -170,9 +205,12 @@ impl Queue {
     /// the machine has, so the window and the player still get a core while a
     /// hundred thousand sounds are being written.
     pub fn workers() -> usize {
+        let lanes = LANES.load(Ordering::Relaxed).max(1);
         std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2).clamp(1, 8))
             .unwrap_or(2)
+            .div_ceil(lanes)
+            .max(1)
     }
 
     /// Put a run in the line.
@@ -183,6 +221,18 @@ impl Queue {
     ///
     /// Returns true when this run started straight away.
     pub fn submit(&self, run: Run) -> bool {
+        // Written down before it is even in the line. A run that is still
+        // waiting when the lights go out was still asked for, and picking it
+        // up later should not depend on harmony having been closed politely.
+        if let Some(note) = run.resume.as_ref() {
+            crate::hm::storage::save_resume(note);
+        }
+        console::note(
+            Channel::Export,
+            Level::Info,
+            format!("lane {}: {} joined the line", self.lane, run.label),
+            format!("{} sounds", run.entries.len()),
+        );
         let mut pending = self.pending.lock().unwrap();
         let mut driving = self.driving.lock().unwrap();
         pending.push_back(run);
@@ -212,6 +262,7 @@ impl Queue {
         let driving = self.driving.clone();
         let hold = self.hold.clone();
         let waiting_note = self.progress.clone();
+        let lane = self.lane;
 
         std::thread::spawn(move || {
             loop {
@@ -257,7 +308,7 @@ impl Queue {
                     }
                     run
                 };
-                execute(run, &progress, &cancel, &paused);
+                execute(run, &progress, &cancel, &paused, lane);
             }
         });
     }
@@ -285,6 +336,17 @@ impl Queue {
             pending.push_front(run);
         }
         self.note_waiting(&pending);
+    }
+
+    /// Take a waiting run out of the line and hand it over whole, so it can be
+    /// started somewhere else — the split view, which lifts something out of
+    /// the line and runs it beside what is already going rather than after it.
+    pub fn take(&self, id: u64) -> Option<Run> {
+        let mut pending = self.pending.lock().unwrap();
+        let at = pending.iter().position(|run| run.id == id)?;
+        let run = pending.remove(at);
+        self.note_waiting(&pending);
+        run
     }
 
     /// Take a run out of the line without touching the one that is going.
@@ -348,6 +410,7 @@ fn execute(
     progress: &Arc<Mutex<Progress>>,
     cancel: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
+    lane: usize,
 ) {
     let Run {
         label,
@@ -361,6 +424,11 @@ fn execute(
         resume,
         ..
     } = run;
+
+    // Kept out of the lock so the checkpoints below can write it down without
+    // reaching back into the window's copy every twenty seconds.
+    let note = resume.clone();
+    let shown = label.clone();
 
     let total = entries.len();
     let bulk = total > LISTED;
@@ -387,6 +455,8 @@ fn execute(
         lock.stalled = None;
         lock.bulk = bulk;
         lock.started = Some(Instant::now());
+        lock.spent = None;
+        lock.lane = lane;
         lock.recent.clear();
         lock.failures.clear();
         lock.bytes = 0;
@@ -397,6 +467,18 @@ fn execute(
     }
     cancel.store(false, Ordering::Relaxed);
     paused.store(false, Ordering::Relaxed);
+    console::deep(
+        Channel::Export,
+        Level::Info,
+        format!("lane {lane}: {shown} started"),
+        vec![
+            format!("into    {}", root.to_string_lossy().to_ascii_lowercase()),
+            format!("format  {}", options.format.label()),
+            format!("tree    {}", options.layout.label()),
+            format!("threads {workers}"),
+            format!("sounds  {total}"),
+        ],
+    );
 
     let entries = Arc::new(entries);
     let packages = Arc::new(packages);
@@ -535,28 +617,38 @@ fn execute(
         }));
     }
 
-    // While the pool runs, the log is rewritten every so often, so a run that
-    // is killed outright still leaves something readable.
-    if log.is_some() {
-        let mut wrote = Instant::now();
-        while !hands.iter().all(|hand| hand.is_finished()) {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            if wrote.elapsed() < CHECKPOINT {
-                continue;
-            }
-            wrote = Instant::now();
-            let (done, failed) = {
-                let lock = progress.lock().unwrap();
-                (lock.done, lock.failed)
-            };
-            if let Some(log) = log.as_mut() {
-                let mut so_far = log.clone();
-                so_far.say(format!(
-                    "still running: {done} written, {failed} failed, {total} in after {}",
-                    liblog::spell(began.elapsed().as_secs_f32())
-                ));
-                so_far.flush();
-            }
+    // While the pool runs, what has happened so far is put down every so
+    // often: the log, so a run that is killed outright still leaves something
+    // readable, and the resume note, so the run can be picked up from where it
+    // actually got to. Nothing here waits for a polite shutdown — a crash, a
+    // pulled plug or a killed process all leave the same note behind.
+    let mut wrote = Instant::now();
+    while !hands.iter().all(|hand| hand.is_finished()) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if wrote.elapsed() < CHECKPOINT {
+            continue;
+        }
+        wrote = Instant::now();
+        let (done, failed) = {
+            let lock = progress.lock().unwrap();
+            (lock.done, lock.failed)
+        };
+        if let Some(note) = note.as_ref() {
+            crate::hm::storage::save_resume(&crate::hm::storage::Resume {
+                done,
+                failed,
+                total,
+                at: stamp(),
+                ..note.clone()
+            });
+        }
+        if let Some(log) = log.as_mut() {
+            let mut so_far = log.clone();
+            so_far.say(format!(
+                "still running: {done} written, {failed} failed, {total} in after {}",
+                liblog::spell(began.elapsed().as_secs_f32())
+            ));
+            so_far.flush();
         }
     }
 
@@ -572,11 +664,60 @@ fn execute(
     }
 
     let (done, failed) = {
-        let lock = progress.lock().unwrap();
+        let mut lock = progress.lock().unwrap();
+        // The clock stops here rather than carrying on being read off the
+        // moment the run began.
+        lock.spent = Some(began.elapsed().as_secs_f32());
         (lock.done, lock.failed)
     };
+    let stopped = cancel.load(Ordering::Relaxed);
+
+    // A run that reached the end has nothing left to pick up, so its note
+    // goes. A run that was stopped — cancelled, out of room, the window shut
+    // on it, the power pulled — keeps one, with what it actually got through.
+    if let Some(note) = note.as_ref() {
+        let note = crate::hm::storage::Resume {
+            done,
+            failed,
+            total,
+            at: stamp(),
+            ..note.clone()
+        };
+        match !stopped && done + failed >= total {
+            true => crate::hm::storage::clear_resume(&note),
+            false => crate::hm::storage::save_resume(&note),
+        }
+    }
+
+    console::deep(
+        Channel::Export,
+        match (stopped, failed) {
+            (true, _) => Level::Warn,
+            (false, 0) => Level::Good,
+            (false, _) => Level::Warn,
+        },
+        format!(
+            "lane {lane}: {shown} {}",
+            match stopped {
+                true => "stopped",
+                false => "finished",
+            }
+        ),
+        vec![
+            format!("written {done} of {total}, {failed} failed"),
+            format!("took    {}", liblog::spell(began.elapsed().as_secs_f32())),
+            format!("into    {}", root.to_string_lossy().to_ascii_lowercase()),
+            match stopped && note.is_some() {
+                true => "written down: it can be picked up from the same folder".to_string(),
+                false => String::new(),
+            },
+        ]
+        .into_iter()
+        .filter(|row| !row.is_empty())
+        .collect(),
+    );
+
     if let Some(log) = log.as_mut() {
-        let stopped = cancel.load(Ordering::Relaxed);
         log.blank();
         log.say(match stopped {
             true => "cancelled",

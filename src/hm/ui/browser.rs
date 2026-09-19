@@ -115,6 +115,73 @@ fn sideways(ui: &egui::Ui) -> f32 {
     ui.data(|data| data.get_temp::<f32>(egui::Id::new("rows_offset")).unwrap_or(0.0))
 }
 
+/// What a frame of the list came away with.
+///
+/// Every view fills the same three things, and they are applied after the list
+/// has been drawn: the catalogue is borrowed while the rows are being laid
+/// out, and every one of these wants it back mutably.
+#[derive(Default)]
+struct Hits {
+    clicked: Option<(usize, bool, bool)>,
+    dragged: Option<usize>,
+    action: Option<Action>,
+}
+
+/// One sound, wherever it is being drawn.
+///
+/// Every view goes through here, so a right-click menu, a drag out of the
+/// window and a starred name work the same in the tree as in the list — which
+/// is the point: a sound found by browsing is no different from a sound found
+/// by searching, and the things that can be done with it should not depend on
+/// how it was found.
+fn sound(
+    ui: &mut egui::Ui,
+    state: &State,
+    index: usize,
+    label: String,
+    picked: bool,
+    star: bool,
+    hits: &mut Hits,
+) {
+    let Some(entry) = state.catalog.entries.get(index) else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if star && entry.favorite {
+            // The phase is the row itself, so a screenful of stars does not
+            // pulse as one thing.
+            widgets::star(ui, 11.0, theme::ACCENT, (index % 32) as f32 * 0.37);
+        }
+        let text = egui::RichText::new(label).color(ink(entry, false));
+        let response = ui
+            .selectable_label(picked, text)
+            .interact(egui::Sense::click_and_drag());
+        if response.clicked() {
+            let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+            hits.clicked = Some((index, ctrl, shift));
+        }
+        // Pulling a row off the list is a drag out of the window: the files
+        // are written while the card is up, then handed over.
+        if response.drag_started() {
+            hits.dragged = Some(index);
+        }
+        response.context_menu(|ui| menu(ui, state, index, &mut hits.action));
+    });
+}
+
+/// Apply what the frame came away with, now that the catalogue is free again.
+fn settle(state: &mut State, hits: Hits) {
+    if let Some(action) = hits.action {
+        run(state, action);
+    }
+    if let Some((index, ctrl, shift)) = hits.clicked {
+        pick(state, index, ctrl, shift);
+    }
+    if let Some(index) = hits.dragged {
+        state.drag_out(Some(index));
+    }
+}
 
 fn grid(ui: &mut egui::Ui, state: &mut State) {
     // Borrowed, not copied. The filtered list is one number per sound and a
@@ -128,7 +195,7 @@ fn grid(ui: &mut egui::Ui, state: &mut State) {
     let columns = (room / 180.0).floor().max(1.0);
     let width = (room / columns) - 8.0;
     let columns = columns as usize;
-    let mut clicked: Option<usize> = None;
+    let mut hits = Hits::default();
     egui::ScrollArea::vertical()
         .id_salt("grid")
         .auto_shrink([false, false])
@@ -147,19 +214,36 @@ fn grid(ui: &mut egui::Ui, state: &mut State) {
                     let response = frame
                         .show(ui, |ui| {
                             ui.set_width(width - 16.0);
-                            ui.colored_label(
-                                ink(entry, false),
-                                crate::hm::discord::clip(&entry.display(), 20),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if entry.favorite {
+                                    widgets::star(
+                                        ui,
+                                        11.0,
+                                        theme::ACCENT,
+                                        (*index % 32) as f32 * 0.37,
+                                    );
+                                }
+                                ui.colored_label(
+                                    ink(entry, false),
+                                    crate::hm::discord::clip(&entry.display(), 20),
+                                );
+                            });
                             ui.colored_label(
                                 theme::DIM,
                                 format!("{:.2}s  {}ch", entry.seconds(), entry.channels),
                             );
                         })
-                        .response;
-                    if response.interact(egui::Sense::click()).clicked() {
-                        clicked = Some(*index);
+                        .response
+                        .interact(egui::Sense::click_and_drag());
+                    if response.clicked() {
+                        let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                        hits.clicked = Some((*index, ctrl, shift));
                     }
+                    if response.drag_started() {
+                        hits.dragged = Some(*index);
+                    }
+                    response.context_menu(|ui| menu(ui, state, *index, &mut hits.action));
                     if (position + 1) % columns == 0 {
                         ui.end_row();
                     }
@@ -167,14 +251,12 @@ fn grid(ui: &mut egui::Ui, state: &mut State) {
             });
         });
     state.filtered = list;
-    if let Some(index) = clicked {
-        state.select(index, true);
-    }
+    settle(state, hits);
 }
 
 fn waveforms(ui: &mut egui::Ui, state: &mut State) {
     let list: Vec<usize> = state.filtered.iter().copied().take(400).collect();
-    let mut clicked: Option<usize> = None;
+    let mut hits = Hits::default();
     egui::ScrollArea::vertical()
         .id_salt("waves")
         .auto_shrink([false, false])
@@ -183,9 +265,14 @@ fn waveforms(ui: &mut egui::Ui, state: &mut State) {
                 let entry = &state.catalog.entries[index];
                 let selected = state.cursor == Some(index);
                 ui.horizontal(|ui| {
-                    ui.colored_label(
-                        ink(entry, selected),
+                    sound(
+                        ui,
+                        state,
+                        index,
                         crate::hm::discord::clip(&entry.display(), 22),
+                        selected,
+                        true,
+                        &mut hits,
                     );
                     let bins = state
                         .loaded
@@ -197,15 +284,14 @@ fn waveforms(ui: &mut egui::Ui, state: &mut State) {
                     let response =
                         widgets::waveform(ui, egui::vec2(width.max(80.0), 22.0), &bins, None);
                     if response.clicked() {
-                        clicked = Some(index);
+                        hits.clicked = Some((index, false, false));
                     }
+                    response.context_menu(|ui| menu(ui, state, index, &mut hits.action));
                     ui.colored_label(theme::DIM, format!("{:.2}s", entry.seconds()));
                 });
             }
         });
-    if let Some(index) = clicked {
-        state.select(index, true);
-    }
+    settle(state, hits);
 }
 
 fn tree(ui: &mut egui::Ui, state: &mut State) {
@@ -213,17 +299,15 @@ fn tree(ui: &mut egui::Ui, state: &mut State) {
     // in the game, and it was being copied whole every frame purely to hand
     // `branch` something that was not borrowed from `state`.
     let root = std::mem::take(&mut state.tree);
-    let mut clicked: Option<usize> = None;
+    let mut hits = Hits::default();
     egui::ScrollArea::vertical()
         .id_salt("browse-tree")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            branch(ui, state, &root, 0, &mut clicked);
+            branch(ui, state, &root, 0, &mut hits);
         });
     state.tree = root;
-    if let Some(index) = clicked {
-        state.select(index, true);
-    }
+    settle(state, hits);
 }
 
 fn branch(
@@ -231,7 +315,7 @@ fn branch(
     state: &State,
     node: &crate::hm::catalog::group::Node,
     depth: usize,
-    clicked: &mut Option<usize>,
+    hits: &mut Hits,
 ) {
     for (label, child) in &node.children {
         let header = format!("{label}  {}", widgets::tally(child.count));
@@ -239,19 +323,15 @@ fn branch(
             .id_salt(format!("{depth}-{label}"))
             .default_open(depth == 0 && node.children.len() < 8)
             .show(ui, |ui| {
-                branch(ui, state, child, depth + 1, clicked);
+                branch(ui, state, child, depth + 1, hits);
                 for id in child.entries.iter().take(500) {
                     let index = id.0 as usize;
-                    if let Some(entry) = state.catalog.entries.get(index)
-                        && ui
-                            .selectable_label(
-                                state.cursor == Some(index),
-                                egui::RichText::new(entry.display()).color(ink(entry, false)),
-                            )
-                            .clicked()
-                    {
-                        *clicked = Some(index);
-                    }
+                    let Some(entry) = state.catalog.entries.get(index) else {
+                        continue;
+                    };
+                    let picked =
+                        state.cursor == Some(index) || state.selection.contains(&index);
+                    sound(ui, state, index, entry.display(), picked, true, hits);
                 }
             });
     }
@@ -259,7 +339,7 @@ fn branch(
 
 fn recent(ui: &mut egui::Ui, state: &mut State) {
     let list = state.recent.clone();
-    let mut clicked: Option<usize> = None;
+    let mut hits = Hits::default();
     egui::ScrollArea::vertical()
         .id_salt("recent")
         .auto_shrink([false, false])
@@ -269,21 +349,13 @@ fn recent(ui: &mut egui::Ui, state: &mut State) {
                 let Some(entry) = state.catalog.entries.get(index) else {
                     continue;
                 };
-                if ui
-                    .selectable_label(
-                        state.cursor == Some(index),
-                        egui::RichText::new(entry.display()).color(ink(entry, false)),
-                    )
-                    .clicked()
-                {
-                    clicked = Some(index);
-                }
+                let picked = state.cursor == Some(index);
+                sound(ui, state, index, entry.display(), picked, true, &mut hits);
             }
         });
-    if let Some(index) = clicked {
-        state.select(index, true);
-    }
+    settle(state, hits);
 }
+
 fn rows(ui: &mut egui::Ui, state: &mut State, detailed: bool) {
     if detailed {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -296,9 +368,7 @@ fn rows(ui: &mut egui::Ui, state: &mut State, detailed: bool) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
     let list = std::mem::take(&mut state.filtered);
-    let mut clicked: Option<(usize, bool, bool)> = None;
-    let mut dragged: Option<usize> = None;
-    let mut action: Option<Action> = None;
+    let mut hits = Hits::default();
     let scrolled = egui::ScrollArea::both()
         .id_salt("rows")
         .auto_shrink([false, false])
@@ -306,23 +376,18 @@ fn rows(ui: &mut egui::Ui, state: &mut State, detailed: bool) {
             for position in range {
                 let index = list[position];
                 let picked = state.cursor == Some(index) || state.selection.contains(&index);
-                let entry = &state.catalog.entries[index];
-                let colour = ink(entry, false);
-                let text = egui::RichText::new(line(state, index, detailed)).color(colour);
-                let response = ui
-                    .selectable_label(picked, text)
-                    .interact(egui::Sense::click_and_drag());
-                if response.clicked() {
-                    let (ctrl, shift) =
-                        ui.input(|i| (i.modifiers.command, i.modifiers.shift));
-                    clicked = Some((index, ctrl, shift));
-                }
-                // Pulling a row off the list is a drag out of the window: the
-                // files are written while the card is up, then handed over.
-                if response.drag_started() {
-                    dragged = Some(index);
-                }
-                response.context_menu(|ui| menu(ui, state, index, &mut action));
+                // The detailed view is columns of fixed width, and a star in
+                // front of the name would push every one of them out of line,
+                // so it keeps the plain row. Compact gets the star.
+                sound(
+                    ui,
+                    state,
+                    index,
+                    line(state, index, detailed),
+                    picked,
+                    !detailed,
+                    &mut hits,
+                );
             }
         });
     // Kept for the header, which is drawn before the list gets a chance to say
@@ -330,15 +395,7 @@ fn rows(ui: &mut egui::Ui, state: &mut State, detailed: bool) {
     ui.data_mut(|data| data.insert_temp(egui::Id::new("rows_offset"), scrolled.state.offset.x));
     // Back before anything below it reads the list again.
     state.filtered = list;
-    if let Some(action) = action {
-        run(state, action);
-    }
-    if let Some((index, ctrl, shift)) = clicked {
-        pick(state, index, ctrl, shift);
-    }
-    if let Some(index) = dragged {
-        state.drag_out(Some(index));
-    }
+    settle(state, hits);
 }
 
 /// What a row's right-click menu asked for, applied once the list is done with.
@@ -364,7 +421,18 @@ fn menu(ui: &mut egui::Ui, state: &State, index: usize, action: &mut Option<Acti
         *action = Some(Action::Drag(index));
         ui.close();
     }
-    if ui.button("favorite").clicked() {
+    let starred = state
+        .catalog
+        .entries
+        .get(index)
+        .is_some_and(|entry| entry.favorite);
+    if ui
+        .button(match starred {
+            true => "unfavorite",
+            false => "favorite",
+        })
+        .clicked()
+    {
         *action = Some(Action::Favorite(index));
         ui.close();
     }

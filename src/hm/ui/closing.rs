@@ -25,21 +25,30 @@ pub fn window(ctx: &egui::Context, state: &mut State) {
     }
 
     let mut answered: Option<Answer> = None;
-    egui::Modal::new(egui::Id::new("closing")).show(ctx, |ui| {
+    let asked = egui::Modal::new(egui::Id::new("closing")).show(ctx, |ui| {
         ui.set_width(380.0);
         ui.colored_label(theme::TEXT, "harmony is still working");
         ui.add_space(6.0);
 
         if let Some((through, total)) = busy.exporting {
             let left = total.saturating_sub(through);
+            let lanes = state.queue.lines().len();
             ui.colored_label(
                 theme::DIM,
-                format!(
-                    "an export is running: {} of {} done, {} to go",
-                    widgets::tally(through),
-                    widgets::tally(total),
-                    widgets::tally(left)
-                ),
+                match lanes > 1 {
+                    true => format!(
+                        "{lanes} lanes are writing: {} of {} done, {} to go",
+                        widgets::tally(through),
+                        widgets::tally(total),
+                        widgets::tally(left)
+                    ),
+                    false => format!(
+                        "an export is running: {} of {} done, {} to go",
+                        widgets::tally(through),
+                        widgets::tally(total),
+                        widgets::tally(left)
+                    ),
+                },
             );
         }
         if busy.queued > 0 {
@@ -72,7 +81,7 @@ pub fn window(ctx: &egui::Context, state: &mut State) {
                 && ui
                     .button("pause and quit")
                     .on_hover_text(
-                        "stop where it is and remember the run, so it can be picked up later",
+                        "stop every lane where it is and write each run down, so they can be picked up later",
                     )
                     .clicked()
             {
@@ -90,6 +99,11 @@ pub fn window(ctx: &egui::Context, state: &mut State) {
             }
         });
     });
+
+    // Over everything, including the console, which is a window of its own and
+    // large enough to hide a question behind. A question that cannot be seen is
+    // a window that cannot be closed.
+    ctx.move_to_top(asked.response.layer_id);
 
     match answered {
         Some(Answer::Save) => {
