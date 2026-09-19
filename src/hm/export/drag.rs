@@ -53,7 +53,6 @@ impl Making {
         std::thread::spawn(move || {
             let mut flat = options.clone();
             flat.layout = layout::Layout::Flat;
-            flat.preserve_paths = false;
             flat.write_manifest = false;
             // A drop of a file that is already there should hand over the file,
             // not skip it and hand over nothing.

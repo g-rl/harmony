@@ -187,6 +187,61 @@ fn similar(ui: &mut egui::Ui, state: &mut State, _index: usize) {
     }
 }
 
+/// How deep a folder tree an extraction builds, and what that looks like.
+///
+/// One ladder rather than a menu and a checkbox beside it: the rungs run from
+/// the file on its own up to the language above the category above the
+/// container, and the line underneath is the path the sound on screen would
+/// actually be written to, so the choice is read off an example rather than
+/// worked out from the names of the modes.
+fn tree(ui: &mut egui::Ui, state: &mut State) {
+    ui.add_space(6.0);
+    ui.colored_label(theme::DIM, "folder tree");
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        for choice in layout::ALL {
+            let on = state.options.layout == *choice;
+            if widgets::chip(ui, choice.label(), on)
+                .on_hover_text(choice.about())
+                .clicked()
+            {
+                state.options.layout = *choice;
+                state.save_options();
+            }
+        }
+    });
+
+    // What the sound on screen would be written as. With nothing selected
+    // there is no example to show, so the rung says what it does instead.
+    let shown = state.cursor.and_then(|index| {
+        let entry = state.catalog.entries.get(index)?;
+        let package = state
+            .mounted
+            .packages
+            .get(entry.package.0 as usize)
+            .cloned()
+            .unwrap_or_else(|| "unknown".into());
+        Some(layout::preview(
+            entry,
+            &package,
+            state.options.layout,
+            state.options.normalise_names,
+            state.options.format.extension(),
+        ))
+    });
+    let line = match &shown {
+        Some(path) => path.as_str(),
+        None => state.options.layout.about(),
+    };
+    ui.add(
+        egui::Label::new(egui::RichText::new(line).color(theme::DIM))
+            .truncate()
+            .selectable(false),
+    )
+    .on_hover_text(line);
+    ui.add_space(4.0);
+}
+
 fn output(ui: &mut egui::Ui, state: &mut State) {
     ui.colored_label(theme::DIM, "output");
     ui.add_space(4.0);
@@ -198,25 +253,9 @@ fn output(ui: &mut egui::Ui, state: &mut State) {
             }
         }
     });
-    egui::ComboBox::from_id_salt("layout")
-        .selected_text(state.options.layout.label())
-        .width(180.0)
-        .show_ui(ui, |ui| {
-            for choice in layout::ALL {
-                if ui
-                    .selectable_label(state.options.layout == *choice, choice.label())
-                    .clicked()
-                {
-                    state.options.layout = *choice;
-                    state.save_options();
-                }
-            }
-        });
+    tree(ui, state);
 
     let mut changed = false;
-    changed |= ui
-        .checkbox(&mut state.options.preserve_paths, "keep folders")
-        .changed();
     changed |= ui
         .checkbox(&mut state.options.normalise_names, "safe names")
         .changed();

@@ -222,7 +222,6 @@ pub fn run_one(
         entry,
         package,
         options.layout,
-        options.preserve_paths,
         options.normalise_names,
         options.format.extension(),
     );

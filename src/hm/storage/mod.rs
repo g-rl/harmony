@@ -105,11 +105,19 @@ impl Settings {
         }
     }
 
+    /// The folder tree an extraction builds.
+    ///
+    /// Settings written before the modes became one ladder say `flat` for the
+    /// shallowest rung. They also had a `keep folders` of their own, and with
+    /// it turned off the default tree wrote every file into one folder, which
+    /// is what the flat rung does now.
     pub fn layout(&self) -> Layout {
         match self.layout.as_str() {
             "language/category" => Layout::LanguageCategory,
             "package" => Layout::Package,
-            "flat" => Layout::Flat,
+            "sound path" => Layout::SoundPath,
+            "file only" | "flat" => Layout::Flat,
+            _ if !self.preserve_paths => Layout::Flat,
             _ => Layout::CategoryPackage,
         }
     }

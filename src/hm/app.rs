@@ -296,7 +296,6 @@ impl State {
         let mut options = Options::default();
         options.format = settings.format();
         options.layout = settings.layout();
-        options.preserve_paths = settings.preserve_paths;
         options.normalise_names = settings.normalise_names;
         options.skip_duplicates = settings.skip_duplicates;
         options.write_manifest = settings.write_manifest;
@@ -2190,7 +2189,7 @@ impl State {
             storage::Preset {
                 format: self.options.format.label().to_string(),
                 layout: self.options.layout.label().to_string(),
-                preserve_paths: self.options.preserve_paths,
+                preserve_paths: self.options.layout.keeps_paths(),
                 normalise_names: self.options.normalise_names,
                 skip_duplicates: self.options.skip_duplicates,
                 write_manifest: self.options.write_manifest,
@@ -2208,7 +2207,6 @@ impl State {
         self.settings.layout = preset.layout;
         self.options.format = self.settings.format();
         self.options.layout = self.settings.layout();
-        self.options.preserve_paths = preset.preserve_paths;
         self.options.normalise_names = preset.normalise_names;
         self.options.skip_duplicates = preset.skip_duplicates;
         self.options.write_manifest = preset.write_manifest;
@@ -2219,7 +2217,7 @@ impl State {
     pub fn save_options(&mut self) {
         self.settings.format = self.options.format.label().to_string();
         self.settings.layout = self.options.layout.label().to_string();
-        self.settings.preserve_paths = self.options.preserve_paths;
+        self.settings.preserve_paths = self.options.layout.keeps_paths();
         self.settings.normalise_names = self.options.normalise_names;
         self.settings.skip_duplicates = self.options.skip_duplicates;
         self.settings.write_manifest = self.options.write_manifest;

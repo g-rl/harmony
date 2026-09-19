@@ -110,6 +110,11 @@ Harmony fingerprints the folder, says what it found and how it knows, and then:
   Ctrl-click adds to the selection, shift-click takes a run.
 - **extract** sends the selection (or everything shown) to the queue, which can be paused,
   cancelled and retried, and writes `manifest.json` alongside the audio when asked.
+- **folder tree** is one ladder of five, shallowest first: `file only` writes straight into
+  the export folder, `sound path` keeps the folders the sound's own name carries, and
+  `package`, `category/package` and `language/category` put one more level above that. The
+  line under the chips is the path the selected sound would actually be written to, so the
+  choice is read off an example rather than guessed from the name of the mode.
 - **drag a row out of the window** to hand the sound to anything else: a folder, a chat, a
   DAW. A card says what is being carried while the files are written to a scratch folder,
   then the drag itself begins. Dragging a row that is part of the selection carries the

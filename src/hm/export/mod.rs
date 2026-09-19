@@ -54,7 +54,6 @@ pub fn estimate(entries: &[Entry], format: Format) -> u64 {
 pub struct Options {
     pub format: Format,
     pub layout: layout::Layout,
-    pub preserve_paths: bool,
     pub normalise_names: bool,
     pub skip_duplicates: bool,
     pub write_manifest: bool,
@@ -65,7 +64,6 @@ impl Default for Options {
         Options {
             format: Format::Wav,
             layout: layout::Layout::CategoryPackage,
-            preserve_paths: true,
             normalise_names: true,
             skip_duplicates: true,
             write_manifest: false,
