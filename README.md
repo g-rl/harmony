@@ -2,7 +2,7 @@
 
 an audio asset explorer for call of duty titles
 
-![chinchou](images/chinchou.png)
+![preview](images/preview.png)
 
 ## currently supported
 
@@ -106,8 +106,16 @@ Harmony fingerprints the folder, says what it found and how it knows, and then:
   values are `campaign`, `multiplayer`, `zombies`, `spec ops`, `warzone` and `shared` —
   shared being everything that carries no marker either way. Grouping by **mode** builds the
   same buckets in the tree, next to category, package and language.
-- Right-click a row for extract, favorite, tags, and to select the rest of its group.
-  Ctrl-click adds to the selection, shift-click takes a run.
+- Right-click a sound for play, extract, drag out, favorite, tags, and to select the rest
+  of its group. Ctrl-click adds to the selection, shift-click takes a run. Every view works
+  the same way: the right-click menu and the drag out of the window are on the rows, the
+  tiles, the waveforms, the recents and both trees, because a sound found by browsing is no
+  different from a sound found by searching.
+- A favorited sound carries a small star in front of its name in the compact list, the tree
+  and `tree+`. It breathes rather than sits still, each one on its own phase, so a
+  favourite is something the eye finds while scrolling a hundred thousand names without
+  anything shouting about it. The detailed view leaves it off: its columns are fixed width,
+  and a star in front of the name would push every one of them out of line.
 - **extract** sends the selection (or everything shown) to the queue, which can be paused,
   cancelled and retried, and writes `manifest.json` alongside the audio when asked.
 - **extract library** takes the whole game, filter or no filter, into a folder of its own:
@@ -126,21 +134,38 @@ Harmony fingerprints the folder, says what it found and how it knows, and then:
   under, and the first folder of the sound's own name — because on some titles it is one
   and on some it is the other. Only the library run leaves anything out; `extract shown`
   writes exactly what is on screen.
-- **a second export while one is running** joins the line rather than replacing it. The run
-  that is going is never interrupted by a click somewhere else: the new one waits, and
-  starts on its own when the one in front finishes. Each run carries its own mount, so the
-  line can hold two different games at once. From the queue window any waiting run can be
-  moved to the front, taken out, or the whole line held so that nothing new starts when the
-  one going ends; **cancel** stops the run that is going and lets the rest carry on, and
+- **a second export while one is running** joins the line rather than replacing it, and so
+  does a third and a tenth: the line takes as many as it is given. The run that is going is
+  never interrupted by a click somewhere else. Each run carries its own mount, so the line
+  can hold two different games at once. From the queue window any waiting run can be moved
+  to the front, taken out, or the whole line held so that nothing new starts when the one
+  going ends; **cancel** stops the run that is going and lets the rest carry on, and
   **cancel all** stops the line with it.
-- **closing while something is running** asks first. An export can be put down rather than
-  thrown away: harmony writes what the run was — game, folder, format, tree, what was left
-  out — and the next time that game is open there is a **resume export** button that runs
-  the same thing again with `skip existing` on, so every file already written is stepped
-  over and the rest carries on. Every run in the line is written down, not only the one
-  that was going, and each gets a file of its own, so closing on a queue of five exports
-  loses none of them. What is not written down is which sounds got written: the
-  folder on disk is that list, and it cannot fall out of step the way a list could.
+- **split view** runs exports side by side instead of one after another. **split view**
+  opens another queue window with a line of its own, **next in its own lane** sends the
+  next export there instead of to the back of the line, and a run already waiting can be
+  lifted out of the line with **split**, which starts it now rather than after everything
+  in front of it. As many lanes can be opened as there is work for. The threads are shared
+  out between them — two lanes are two halves of the machine, not two machines —
+  and a lane with nothing left to do closes with its window. Lane one never closes: it is
+  where everything lands by default.
+- The clock on a finished run stops when the run does. `took 22m 54s` is what it took,
+  rather than a stopwatch nobody remembered to stop.
+- **an export writes itself down as it goes**, whether or not harmony is closed politely. A
+  note goes on disk the moment a run joins a line, is brought up to date every twenty
+  seconds while it writes, and is cleared only when the run reaches the end. A crash, a
+  killed process, a pulled plug and a cancelled queue all leave the same thing behind: a
+  run that can be picked up. Open the game again and the put-down exports are listed under
+  the export panel with how far each of them got, and the console says so on the way up;
+  **resume export** runs the same thing into the same folder with `skip existing` on, so
+  every file already written is stepped over and the rest carries on. What is never
+  written down is which sounds got written — the folder on disk is that list, and it
+  cannot fall out of step the way a list could.
+- **closing while something is running** asks first, and **pause and quit** stops every
+  lane where it is and writes down every run in every one of them, so closing on a queue
+  of five exports loses none of them. Each run has a file of its own, named after the game
+  and the folder it writes into, so sending the same library to the same folder twice
+  lands on the same note rather than leaving orphans behind.
 - **folder tree** is one ladder of five, shallowest first: `file only` writes straight into
   the export folder, `sound path` keeps the folders the sound's own name carries, and
   `package`, `category/package` and `language/category` put one more level above that. The
@@ -203,6 +228,64 @@ listened to and the game it is from, the game changing the moment a tab does, an
 while one is running — `extracting 12.0k of 122k`, with the percentage beside the game and
 a clock counting the run rather than the session. A sound harmony could not name is shown
 under its container, `zmb_tomb.all/_f6a6b431ac13033b`, rather than as a bare number.
+
+## the console
+
+Tilde opens it, from anywhere, including the middle of typing a search. It is not a
+terminal and does not pretend to be one: a terminal has one stream and colours words in it,
+this has channels, levels and detail.
+
+```
+21:04:11  | export  done  lane 1: bo3 - 27,605 sounds finished
+                          written 27,601 of 27,605, 4 failed
+                          took    22m 54s
+```
+
+The clock, then the channel in its own fixed colour, then what kind of line it is, then the
+sentence. A line with more to say carries it underneath: folded away unless something went
+wrong, and one click either way. Failures carry a faint red stripe so a bad run reads as a
+shape rather than as something to be read.
+
+Channels are the point. `app`, `game`, `scan`, `pack`, `export`, `audio`, `names`, `disk`,
+`discord` and `debug` — every part of harmony writes to one of them, and a chip at the top
+turns each on and off with its count beside it, so a library run pouring out a line a
+second can be watched on its own. `debug` is off until it is asked for. Levels filter the
+same way, and **find** narrows to lines with a word in them, detail included.
+
+Commands are dotted, so a family of them reads as one thing: `export.library`,
+`export.split`, `lane.split`, `lane.close`, `queue`, `resume.list`, `resume.start`,
+`skip.add`, `scan.depth`, `game.open`, `crash.dump`, `stat`, `paths`, `open`. Tab completes
+and the prompt shows what it would complete with in front of the caret; a few letters are
+enough, in order and not necessarily together, so `elib` finds `export.library`. The
+arrows walk what has been typed before, and a name that is not a command is pointed at the
+one it nearly was. `help` lists the lot with what each takes.
+
+It is a window rather than a lid: drag it anywhere, resize it from any edge, and it comes
+back where it was left. It stays off harmony's own title bar, which carries the close button
+and is what the window is dragged by, and it slides in and out rather than appearing.
+
+Everything said on the console is also written to `%APPDATA%\harmony\console.log` as it
+happens, by a thread of its own so nothing waits on a disk to say something, and rolled
+aside at four megabytes. That file is what a crash report takes its tail from.
+
+## when something falls over
+
+Harmony keeps crash reports the way the games keep minidumps: a folder per fall, named for
+the moment it happened — `crash-2026-09-16-15-36-16` — under `%APPDATA%\harmony\crashes\`.
+Each holds three things:
+
+- `report.txt` — what happened, where, and on which thread; the stack it came from; what
+  windows and the machine actually are; what harmony was doing, which game, how many sounds
+  and which lanes were writing; the exports that were put down and where to pick them up;
+  and the last sixty console lines.
+- `console.log` — the whole scrollback as it stood, not only the tail.
+- `state.json` — the same state in a form something else can read.
+
+A panic on a worker does not take the window with it: the line goes on the console in red,
+the report is written, and harmony carries on. The newest twenty reports are kept. Nothing
+in a report leaves the machine — harmony uploads nothing, ever — and `crash.dump` at the
+console writes one on purpose, without anything having gone wrong, which is the thing to
+send when something is merely behaving oddly.
 
 ## sorting
 
@@ -282,14 +365,23 @@ harmony --hash <name> [name...]                # a name under every hash harmony
 harmony --names <game key> <depth> <list...>   # match a cached scan against name lists
 harmony --names-probe <game key> <depth> <csv> # how much of a scan one list names
 harmony --sort <game key> <depth>              # how a cached scan files itself
+
+harmony --pull <game folder> <n> <out> [split] # n sounds out in all four formats, through
+                                               # the real queue; "split" gives each format
+                                               # a lane of its own instead of a place in
+                                               # the line
+harmony --crash-report [panic]                 # write a crash report; "panic" falls over
+                                               # on purpose to prove the hook
 ```
 
 ## where harmony keeps things
 
 `%APPDATA%\harmony\`: `settings.json` (the folder remembered for each game, output,
 favorites, tags, collections, presets, window size) and `scan-<game>-<depth>.json` (the cached catalogue of a scan) and
-`zones-<game>.json` (what each fastfile turned out to hold), and a `resume` folder holding one
-note per export that has been put down and not yet picked up.
+`zones-<game>.json` (what each fastfile turned out to hold), a `resume` folder holding one
+note per export that has been put down and not yet picked up, `console.log` (everything the
+console has said, rolled aside at four megabytes) and a `crashes` folder holding the last
+twenty crash reports.
 
 All three writing folders can be moved, from **folders** in the right-hand panel:
 
@@ -327,6 +419,12 @@ Needs a Rust toolchain with the 2024 edition. On Windows the build script turns
 `images/chinchou.png` into the icon compiled into the exe, so the taskbar, Explorer and the
 window all show the same thing. No C toolchain, no cmake: the Opus decoder
 is pure Rust.
+
+## working on it
+
+`CLAUDE.md` is the entry point for anyone, or anything, picking the codebase up: the
+standing rules, the house style, and a table pointing at the one doc under `docs/` that
+covers the area being worked on rather than the lot.
 
 ## how it works
 
