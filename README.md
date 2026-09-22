@@ -1,7 +1,5 @@
 # harmony
 
-an audio asset explorer for call of duty titles
-
 ![preview](images/preview.png)
 
 ## currently supported
